@@ -18,6 +18,7 @@ uv.lock
 __pycache__/
 *.py[cod]
 *.so
+*.egg-info/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
@@ -35,6 +36,7 @@ htmlcov/
 # Logs and runtime outputs
 logs/
 log/
+output/
 outputs/
 artifacts/
 checkpoints/

@@ -1,5 +1,42 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "uncertain-racecar-gym"
 version = "0.1.0"
+description = "A racecar-focused Gymnasium environment with empirical uncertainty and 3D rendering."
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+  "gymnasium>=0.29,<1.0",
+  "imageio>=2.34,<3.0",
+  "imageio-ffmpeg>=0.5,<1.0",
+  "matplotlib>=3.8,<4.0",
+  "numpy>=1.26,<3.0",
+  "pandas>=2.2,<3.0",
+  "pyarrow>=15,<19",
+  "pybullet>=3.2.6,<4.0",
+  "pyyaml>=6.0,<7.0",
+  "scipy>=1.11,<2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0,<9.0",
+]
+
+[project.scripts]
+uncertain-racecar-build-dataset = "uncertain_racecar_gym.cli:build_dataset_main"
+uncertain-racecar-fit-uncertainty = "uncertain_racecar_gym.cli:fit_uncertainty_main"
+uncertain-racecar-record-rollout = "uncertain_racecar_gym.cli:record_rollout_main"
+uncertain-racecar-export-replay = "uncertain_racecar_gym.cli:export_replay_main"
+uncertain-racecar-analyze-uncertainty = "uncertain_racecar_gym.cli:analyze_uncertainty_main"
+
+[tool.setuptools.packages.find]
+include = ["uncertain_racecar_gym*"]
+
+[tool.setuptools.package-data]
+uncertain_racecar_gym = ["assets/**/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
