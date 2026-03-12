@@ -1,0 +1,67 @@
+.DS_Store
+
+# Reference repositories kept locally only
+assetto_corsa_gym/
+racecar_gym/
+
+# Python environments
+.venv/
+venv/
+env/
+.python-version
+
+# uv
+uv.lock
+
+# Python cache and tooling
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+
+# Coverage and test outputs
+.coverage
+.coverage.*
+htmlcov/
+
+# IDE and editor files
+.idea/
+.vscode/
+
+# Logs and runtime outputs
+logs/
+log/
+outputs/
+artifacts/
+checkpoints/
+telemetry/
+tmp/
+temp/
+
+# Common data directories
+data/
+datasets/
+
+# Large data and model artifacts
+*.parquet
+*.pkl
+*.pickle
+*.npz
+*.npy
+*.csv
+*.tsv
+*.h5
+*.hdf5
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# Media artifacts
+*.mp4
+*.avi
+*.mov
+*.gif
