@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 
 from uncertain_racecar_gym.common import wrap_angle
 from uncertain_racecar_gym.scenario import TrackConfig
@@ -26,7 +27,15 @@ class TrackModel:
             raise ValueError("Track centerline must contain at least four points.")
         if np.allclose(centerline[0], centerline[-1]):
             centerline = centerline[:-1]
-        self.centerline = np.asarray(centerline, dtype=float)
+        centerline = np.asarray(centerline, dtype=float)
+        deduped = [centerline[0]]
+        for point in centerline[1:]:
+            if np.linalg.norm(point - deduped[-1]) > 1e-4:
+                deduped.append(point)
+        centerline = np.asarray(deduped, dtype=float)
+        if centerline.shape[0] < 4:
+            raise ValueError("Track centerline must contain at least four distinct points.")
+        self.centerline = centerline
         self.width = float(width)
         self.closed = bool(closed)
         self.progress_bins = int(progress_bins)
@@ -48,8 +57,12 @@ class TrackModel:
 
     @classmethod
     def from_config(cls, config: TrackConfig) -> "TrackModel":
-        data = np.loadtxt(Path(config.csv), delimiter=",", skiprows=1)
-        return cls(centerline=data[:, :2], width=config.width, closed=config.closed, progress_bins=config.progress_bins)
+        frame = pd.read_csv(Path(config.csv))
+        if {"x", "y"}.issubset(frame.columns):
+            centerline = frame[["x", "y"]].to_numpy(dtype=float)
+        else:
+            centerline = frame.iloc[:, :2].to_numpy(dtype=float)
+        return cls(centerline=centerline, width=config.width, closed=config.closed, progress_bins=config.progress_bins)
 
     def progress_to_arc(self, progress: float) -> float:
         return float(progress % 1.0) * self.length

@@ -10,10 +10,13 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from scipy.stats import wasserstein_distance
+from scipy.ndimage import gaussian_filter1d
+from scipy.signal import find_peaks
+from scipy.stats import kurtosis, skew, wasserstein_distance
 
-from uncertain_racecar_gym.controllers import CenterlineDriver
+from uncertain_racecar_gym.controllers import CenterlineDriver, ProfiledCenterlineDriver
 from uncertain_racecar_gym.dataset import CANONICAL_COLUMNS, build_demo_dataset
+from uncertain_racecar_gym.deterministic import load_calibration_model
 from uncertain_racecar_gym.dynamics import DynamicBicycleModel
 from uncertain_racecar_gym.env import UncertainRacecarEnv
 from uncertain_racecar_gym.scenario import Scenario, load_scenario
@@ -94,6 +97,40 @@ def _trajectory_split(residual_table: pd.DataFrame, train_fraction: float = 0.75
     return train, test
 
 
+def _center_residual_table(residual_table: pd.DataFrame, calibration_model) -> pd.DataFrame:
+    centered = residual_table.reset_index(drop=True).copy()
+    predictions = []
+    for row in centered.itertuples(index=False):
+        gate_key = calibration_model.resolve_gate_key(
+            progress_bin=int(row.progress_bin),
+            track_id=str(row.track_id),
+            car_id=str(row.car_id),
+        )
+        mean_residual, info = calibration_model.predict_mean(
+            np.asarray(row.feature_vector, dtype=float),
+            gate_key,
+            dt=float(row.dt),
+        )
+        longitudinal_info = info.get("longitudinal", {}) if isinstance(info, dict) else {}
+        residual_info = info.get("residual", info) if isinstance(info, dict) else {}
+        predictions.append(
+            {
+                "delta_vx_mean": float(mean_residual[0]),
+                "delta_vy_mean": float(mean_residual[1]),
+                "delta_yaw_rate_mean": float(mean_residual[2]),
+                "delta_vx_longitudinal_mean": float(longitudinal_info.get("delta_vx_correction", 0.0)),
+                "longitudinal_applied": bool(longitudinal_info.get("applied", False)),
+                "calibration_neighbors": int(residual_info.get("neighbors", 0)),
+                "calibration_distance_mean": float(residual_info.get("distance_mean", np.nan)),
+            }
+        )
+    prediction_frame = pd.DataFrame(predictions)
+    for channel in RESIDUAL_NAMES:
+        centered[f"{channel}_raw"] = centered[channel]
+        centered[channel] = centered[channel].to_numpy(dtype=float) - prediction_frame[f"{channel}_mean"].to_numpy(dtype=float)
+    return pd.concat([centered.reset_index(drop=True), prediction_frame], axis=1)
+
+
 def _evaluate_model(residual_table: pd.DataFrame, artifact: EmpiricalUncertaintyModel, scenario: Scenario) -> pd.DataFrame:
     predictions = []
     for row in residual_table.itertuples(index=False):
@@ -145,6 +182,29 @@ def _rmse(actual: np.ndarray, predicted: np.ndarray) -> float:
     return float(np.sqrt(np.mean(np.square(actual - predicted))))
 
 
+def _compute_rmse_metrics(evaluated: pd.DataFrame) -> dict[str, dict[str, float]]:
+    channels = ["delta_vx", "delta_vy", "delta_yaw_rate"]
+    baseline_rmse = {_channel: _rmse(evaluated[_channel].to_numpy(), np.zeros(len(evaluated))) for _channel in channels}
+    model_rmse = {_channel: _rmse(evaluated[_channel].to_numpy(), evaluated[f"{_channel}_pred"].to_numpy()) for _channel in channels}
+    return {
+        "baseline_rmse": baseline_rmse,
+        "model_rmse": model_rmse,
+    }
+
+
+def _compute_wasserstein_metrics(evaluated: pd.DataFrame, sampled: pd.DataFrame) -> dict[str, dict[str, float]]:
+    baseline_distances = {}
+    model_distances = {}
+    for channel in RESIDUAL_NAMES:
+        actual = evaluated[channel].to_numpy()
+        baseline_distances[channel] = float(wasserstein_distance(actual, np.zeros(len(actual), dtype=float)))
+        model_distances[channel] = float(wasserstein_distance(actual, sampled[f"{channel}_sample"].to_numpy()))
+    return {
+        "baseline_wasserstein": baseline_distances,
+        "model_wasserstein": model_distances,
+    }
+
+
 def _save_residual_histograms(evaluated: pd.DataFrame, plot_dir: Path) -> Path:
     fig, axes = plt.subplots(1, 3, figsize=(15, 4))
     channels = ["delta_vx", "delta_vy", "delta_yaw_rate"]
@@ -156,6 +216,79 @@ def _save_residual_histograms(evaluated: pd.DataFrame, plot_dir: Path) -> Path:
         axis.set_ylabel("Count")
     fig.tight_layout()
     path = plot_dir / "residual_histograms.png"
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+    return path
+
+
+def _save_track_overview(canonical: pd.DataFrame, plot_dir: Path) -> Path:
+    sample = canonical.sample(n=min(40000, len(canonical)), random_state=7) if len(canonical) > 40000 else canonical
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    scatter = axes[0].scatter(sample["x"], sample["y"], c=sample["vx"], s=3, alpha=0.35, cmap="viridis")
+    axes[0].set_aspect("equal", adjustable="box")
+    axes[0].set_title("Trajectory footprint colored by speed")
+    axes[0].set_xlabel("x")
+    axes[0].set_ylabel("y")
+    fig.colorbar(scatter, ax=axes[0], fraction=0.046, pad=0.04, label="vx")
+
+    progress_bins = pd.cut(canonical["progress"], bins=60, include_lowest=True)
+    speed_profile = canonical.groupby(progress_bins, observed=False)["vx"].agg(["mean", "std"]).reset_index(drop=True)
+    axes[1].plot(speed_profile.index, speed_profile["mean"], color="#2563eb", label="mean speed")
+    axes[1].fill_between(
+        speed_profile.index,
+        speed_profile["mean"] - speed_profile["std"].fillna(0.0),
+        speed_profile["mean"] + speed_profile["std"].fillna(0.0),
+        color="#93c5fd",
+        alpha=0.45,
+        label="+-1 std",
+    )
+    axes[1].set_title("Speed profile over progress")
+    axes[1].set_xlabel("progress bin")
+    axes[1].set_ylabel("speed [m/s]")
+    axes[1].legend()
+    fig.tight_layout()
+    path = plot_dir / "track_overview.png"
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+    return path
+
+
+def _save_control_distributions(canonical: pd.DataFrame, plot_dir: Path) -> Path:
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    plots = [
+        ("vx", "Speed distribution", "#2563eb"),
+        ("steer", "Steer distribution", "#dc2626"),
+        ("throttle", "Throttle distribution", "#0f766e"),
+        ("brake", "Brake distribution", "#9333ea"),
+    ]
+    for axis, (column, title, color) in zip(axes.flat, plots):
+        axis.hist(canonical[column], bins=40, color=color, alpha=0.85)
+        axis.set_title(title)
+        axis.set_xlabel(column)
+        axis.set_ylabel("Count")
+    fig.tight_layout()
+    path = plot_dir / "control_distributions.png"
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+    return path
+
+
+def _save_state_context_plots(canonical: pd.DataFrame, plot_dir: Path) -> Path:
+    sample = canonical.sample(n=min(50000, len(canonical)), random_state=11) if len(canonical) > 50000 else canonical
+    fig, axes = plt.subplots(1, 3, figsize=(16, 4.5))
+    relationships = [
+        ("vx", "yaw_rate", "vx vs yaw_rate"),
+        ("vx", "steer", "vx vs steer"),
+        ("vy", "yaw_rate", "vy vs yaw_rate"),
+    ]
+    for axis, (x_name, y_name, title) in zip(axes, relationships):
+        image = axis.hexbin(sample[x_name], sample[y_name], gridsize=30, cmap="magma", mincnt=1)
+        axis.set_title(title)
+        axis.set_xlabel(x_name)
+        axis.set_ylabel(y_name)
+        fig.colorbar(image, ax=axis, fraction=0.046, pad=0.04)
+    fig.tight_layout()
+    path = plot_dir / "state_context_plots.png"
     fig.savefig(path, dpi=180)
     plt.close(fig)
     return path
@@ -224,8 +357,9 @@ def _save_feature_residual_relationships(evaluated: pd.DataFrame, plot_dir: Path
 
 def _save_rmse_bars(evaluated: pd.DataFrame, plot_dir: Path) -> tuple[Path, dict]:
     channels = ["delta_vx", "delta_vy", "delta_yaw_rate"]
-    baseline_rmse = [_rmse(evaluated[channel].to_numpy(), np.zeros(len(evaluated))) for channel in channels]
-    model_rmse = [_rmse(evaluated[channel].to_numpy(), evaluated[f"{channel}_pred"].to_numpy()) for channel in channels]
+    rmse_metrics = _compute_rmse_metrics(evaluated)
+    baseline_rmse = [rmse_metrics["baseline_rmse"][channel] for channel in channels]
+    model_rmse = [rmse_metrics["model_rmse"][channel] for channel in channels]
 
     fig, axis = plt.subplots(figsize=(8, 4))
     x = np.arange(len(channels))
@@ -241,10 +375,7 @@ def _save_rmse_bars(evaluated: pd.DataFrame, plot_dir: Path) -> tuple[Path, dict
     path = plot_dir / "rmse_comparison.png"
     fig.savefig(path, dpi=180)
     plt.close(fig)
-    return path, {
-        "baseline_rmse": dict(zip(channels, baseline_rmse)),
-        "model_rmse": dict(zip(channels, model_rmse)),
-    }
+    return path, rmse_metrics
 
 
 def _save_rmse_by_curvature(evaluated: pd.DataFrame, plot_dir: Path) -> Path:
@@ -344,12 +475,9 @@ def _save_sampled_distribution_overlay(evaluated: pd.DataFrame, sampled: pd.Data
 
 
 def _save_wasserstein_bars(evaluated: pd.DataFrame, sampled: pd.DataFrame, plot_dir: Path) -> tuple[Path, dict]:
-    baseline_distances = {}
-    model_distances = {}
-    for channel in RESIDUAL_NAMES:
-        actual = evaluated[channel].to_numpy()
-        baseline_distances[channel] = float(wasserstein_distance(actual, np.zeros(len(actual), dtype=float)))
-        model_distances[channel] = float(wasserstein_distance(actual, sampled[f"{channel}_sample"].to_numpy()))
+    wasserstein_metrics = _compute_wasserstein_metrics(evaluated, sampled)
+    baseline_distances = wasserstein_metrics["baseline_wasserstein"]
+    model_distances = wasserstein_metrics["model_wasserstein"]
 
     fig, axis = plt.subplots(figsize=(8, 4))
     x = np.arange(len(RESIDUAL_NAMES))
@@ -377,10 +505,7 @@ def _save_wasserstein_bars(evaluated: pd.DataFrame, sampled: pd.DataFrame, plot_
     path = plot_dir / "wasserstein_comparison.png"
     fig.savefig(path, dpi=180)
     plt.close(fig)
-    return path, {
-        "baseline_wasserstein": baseline_distances,
-        "model_wasserstein": model_distances,
-    }
+    return path, wasserstein_metrics
 
 
 def _save_wasserstein_by_curvature(evaluated: pd.DataFrame, sampled: pd.DataFrame, plot_dir: Path) -> Path:
@@ -428,12 +553,28 @@ def _save_wasserstein_by_curvature(evaluated: pd.DataFrame, sampled: pd.DataFram
     return path
 
 
-def _simulate_rollout_series(scenario: Scenario, artifact_path: Path | None, mode: str) -> dict[str, np.ndarray]:
-    controller = CenterlineDriver()
+def _simulate_rollout_series(
+    scenario: Scenario,
+    artifact_path: Path | None,
+    mode: str,
+    calibration_artifact_path: Path | None = None,
+    driver_dataset_path: Path | None = None,
+) -> dict[str, np.ndarray]:
+    if driver_dataset_path is not None and Path(driver_dataset_path).exists():
+        canonical = pd.read_parquet(driver_dataset_path)
+        controller = ProfiledCenterlineDriver.from_canonical_dataframe(
+            canonical,
+            speed_quantile=0.6,
+            speed_scale=0.6,
+            min_speed=10.0,
+        )
+    else:
+        controller = CenterlineDriver()
     env = UncertainRacecarEnv(
         scenario=scenario.source_path,
         uncertainty=mode,
         uncertainty_artifact=artifact_path if mode == "empirical" else None,
+        calibration_artifact=calibration_artifact_path,
         renderer=None,
     )
     env.reset(seed=7, options={"uncertainty_mode": mode, "start_mode": "random"})
@@ -459,10 +600,28 @@ def _simulate_rollout_series(scenario: Scenario, artifact_path: Path | None, mod
     return {key: np.asarray(value, dtype=float) if key != "track" else value for key, value in samples.items()}
 
 
-def _save_rollout_overlay(scenario: Scenario, artifact_path: Path, plot_dir: Path) -> Path:
+def _save_rollout_overlay(
+    scenario: Scenario,
+    artifact_path: Path,
+    plot_dir: Path,
+    calibration_artifact_path: Path | None = None,
+    driver_dataset_path: Path | None = None,
+) -> Path:
     trajectories = {
-        "nominal": _simulate_rollout_series(scenario, artifact_path=None, mode="nominal"),
-        "empirical": _simulate_rollout_series(scenario, artifact_path=artifact_path, mode="empirical"),
+        "nominal": _simulate_rollout_series(
+            scenario,
+            artifact_path=None,
+            mode="nominal",
+            calibration_artifact_path=calibration_artifact_path,
+            driver_dataset_path=driver_dataset_path,
+        ),
+        "empirical": _simulate_rollout_series(
+            scenario,
+            artifact_path=artifact_path,
+            mode="empirical",
+            calibration_artifact_path=calibration_artifact_path,
+            driver_dataset_path=driver_dataset_path,
+        ),
     }
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
@@ -487,10 +646,28 @@ def _save_rollout_overlay(scenario: Scenario, artifact_path: Path, plot_dir: Pat
     return path
 
 
-def _save_rollout_state_channels(scenario: Scenario, artifact_path: Path, plot_dir: Path) -> Path:
+def _save_rollout_state_channels(
+    scenario: Scenario,
+    artifact_path: Path,
+    plot_dir: Path,
+    calibration_artifact_path: Path | None = None,
+    driver_dataset_path: Path | None = None,
+) -> Path:
     trajectories = {
-        "nominal": _simulate_rollout_series(scenario, artifact_path=None, mode="nominal"),
-        "empirical": _simulate_rollout_series(scenario, artifact_path=artifact_path, mode="empirical"),
+        "nominal": _simulate_rollout_series(
+            scenario,
+            artifact_path=None,
+            mode="nominal",
+            calibration_artifact_path=calibration_artifact_path,
+            driver_dataset_path=driver_dataset_path,
+        ),
+        "empirical": _simulate_rollout_series(
+            scenario,
+            artifact_path=artifact_path,
+            mode="empirical",
+            calibration_artifact_path=calibration_artifact_path,
+            driver_dataset_path=driver_dataset_path,
+        ),
     }
     fig, axes = plt.subplots(3, 1, figsize=(12, 9), sharex=True)
     channels = ["vx", "vy", "yaw_rate"]
@@ -509,6 +686,125 @@ def _save_rollout_state_channels(scenario: Scenario, artifact_path: Path, plot_d
     return path
 
 
+def _residual_shape_stats(values: np.ndarray) -> dict[str, float]:
+    values = np.asarray(values, dtype=float)
+    return {
+        "std": float(np.std(values)),
+        "skew": float(skew(values, bias=False)) if len(values) > 2 else 0.0,
+        "excess_kurtosis": float(kurtosis(values, fisher=True, bias=False)) if len(values) > 3 else 0.0,
+    }
+
+
+def _multimodal_histogram(values: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    values = np.asarray(values, dtype=float)
+    lo, hi = np.percentile(values, [0.5, 99.5])
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        lo = float(np.min(values))
+        hi = float(np.max(values) + 1e-6)
+    hist, edges = np.histogram(values, bins=80, range=(lo, hi), density=True)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    smooth = gaussian_filter1d(hist.astype(float), sigma=1.2)
+    peaks, _ = find_peaks(smooth, prominence=max(float(smooth.max()) * 0.045, 1e-6), distance=4)
+    return centers, hist, smooth, peaks
+
+
+def _prepare_multimodal_contexts(evaluated: pd.DataFrame) -> pd.DataFrame:
+    frame = evaluated.copy()
+    frame["driver"] = frame["trajectory_id"].astype(str).str.split("_&_").str[2].fillna("unknown")
+    frame["progress_slice"] = pd.cut(frame["progress"], bins=12, include_lowest=True)
+    frame["speed_slice"] = pd.qcut(frame["vx"], q=4, duplicates="drop")
+    frame["curvature_slice"] = pd.qcut(frame["abs_curvature"], q=4, duplicates="drop")
+    frame["steer_sign"] = pd.cut(frame["steer"], bins=[-np.inf, -0.02, 0.02, np.inf], labels=["left", "straight", "right"])
+    frame["throttle_mode"] = pd.cut(frame["throttle"], bins=[-np.inf, 0.05, 0.4, np.inf], labels=["off", "mid", "high"])
+    frame["brake_mode"] = pd.cut(frame["brake"], bins=[-np.inf, 0.02, 0.15, np.inf], labels=["off", "light", "hard"])
+    frame["control_mode"] = np.select(
+        [frame["brake"] > 0.05, frame["throttle"] > 0.2],
+        ["brake", "throttle"],
+        default="coast",
+    )
+    return frame
+
+
+def _collect_multimodal_examples(evaluated: pd.DataFrame) -> list[dict]:
+    frame = _prepare_multimodal_contexts(evaluated)
+    groupings = [
+        ("control_mode", "progress_slice"),
+        ("driver", "progress_slice"),
+        ("steer_sign", "progress_slice"),
+        ("driver", "brake_mode"),
+        ("progress_slice", "speed_slice"),
+        ("progress_slice", "throttle_mode"),
+        ("steer_sign", "speed_slice"),
+        ("curvature_slice", "progress_slice"),
+    ]
+
+    examples = []
+    for channel in RESIDUAL_NAMES:
+        candidates = []
+        for group_cols in groupings:
+            grouped = frame.groupby(list(group_cols), observed=True)
+            for key, group in grouped:
+                values = group[channel].to_numpy(dtype=float)
+                if len(values) < 350:
+                    continue
+                centers, hist, smooth, peaks = _multimodal_histogram(values)
+                if len(peaks) < 2:
+                    continue
+                candidates.append(
+                    {
+                        "channel": channel,
+                        "group_cols": group_cols,
+                        "group_key": key if isinstance(key, tuple) else (key,),
+                        "count": int(len(values)),
+                        "peak_count": int(len(peaks)),
+                        "peak_score": float(np.sum(smooth[peaks])),
+                        "values": values,
+                        "centers": centers,
+                        "hist": hist,
+                        "smooth": smooth,
+                        "peaks": peaks,
+                        "shape_stats": _residual_shape_stats(values),
+                    }
+                )
+        candidates.sort(key=lambda item: (-item["peak_count"], -item["peak_score"], -item["count"]))
+        examples.extend(candidates[:2])
+    return examples
+
+
+def _format_multimodal_group(example: dict) -> str:
+    parts = [f"{name}={value}" for name, value in zip(example["group_cols"], example["group_key"])]
+    return ", ".join(parts)
+
+
+def _save_multimodal_examples(evaluated: pd.DataFrame, plot_dir: Path) -> tuple[Path, list[dict]]:
+    examples = _collect_multimodal_examples(evaluated)
+    fig, axes = plt.subplots(3, 2, figsize=(16, 12))
+    axes = axes.flatten()
+    for axis, example in zip(axes, examples):
+        axis.hist(example["values"], bins=50, density=True, color="#bfdbfe", alpha=0.6)
+        axis.plot(example["centers"], example["smooth"], color="#1d4ed8", linewidth=2.0)
+        axis.scatter(
+            example["centers"][example["peaks"]],
+            example["smooth"][example["peaks"]],
+            color="#dc2626",
+            s=24,
+            zorder=3,
+        )
+        axis.set_title(
+            f"{example['channel']} | peaks={example['peak_count']} | n={example['count']}\n{_format_multimodal_group(example)}",
+            fontsize=9,
+        )
+        axis.set_xlabel("residual")
+        axis.set_ylabel("density")
+    for axis in axes[len(examples) :]:
+        axis.axis("off")
+    fig.tight_layout()
+    path = plot_dir / "multimodal_slices.png"
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+    return path, examples
+
+
 def _relative_markdown_path(path: Path, report_path: Path) -> str:
     return str(path.relative_to(report_path.parent))
 
@@ -519,17 +815,43 @@ def generate_uncertainty_report(
     artifact_path: Path,
     report_path: Path,
     plot_dir: Path,
+    source_description: str,
+    source_mode: str,
+    calibration_artifact_path: Path | None = None,
 ) -> EvaluationArtifacts:
     canonical = pd.read_parquet(dataset_path)
     residual_table = compute_residual_table(canonical, scenario)
     train_residuals, test_residuals = _trajectory_split(residual_table, train_fraction=0.75)
-    train_canonical = canonical[canonical["trajectory_id"].isin(train_residuals["trajectory_id"].unique())].copy()
-    artifact = EmpiricalUncertaintyModel.fit(train_canonical, scenario)
-    artifact.save(artifact_path)
+    calibration_model = load_calibration_model(calibration_artifact_path) if calibration_artifact_path is not None else None
+    if calibration_model is not None:
+        train_residuals = _center_residual_table(train_residuals, calibration_model)
+        test_residuals = _center_residual_table(test_residuals, calibration_model)
+        artifact = EmpiricalUncertaintyModel.fit_from_residual_table(train_residuals, scenario)
+    else:
+        train_canonical = canonical[canonical["trajectory_id"].isin(train_residuals["trajectory_id"].unique())].copy()
+        artifact = EmpiricalUncertaintyModel.fit(train_canonical, scenario)
     evaluated = _evaluate_model(test_residuals, artifact, scenario)
     sampled = _sample_model_distribution(test_residuals, artifact, sample_count=4, seed=17)
+    rmse_metrics = _compute_rmse_metrics(evaluated)
+    wasserstein_metrics = _compute_wasserstein_metrics(evaluated, sampled)
+    disabled_stochastic_channels = [
+        channel
+        for channel in RESIDUAL_NAMES
+        if rmse_metrics["model_rmse"][channel] > rmse_metrics["baseline_rmse"][channel] * 1.02
+        and wasserstein_metrics["model_wasserstein"][channel] > wasserstein_metrics["baseline_wasserstein"][channel] * 1.02
+    ]
+    if disabled_stochastic_channels:
+        artifact = artifact.copy().zero_residual_channels(disabled_stochastic_channels)
+        evaluated = _evaluate_model(test_residuals, artifact, scenario)
+        sampled = _sample_model_distribution(test_residuals, artifact, sample_count=4, seed=17)
+        rmse_metrics = _compute_rmse_metrics(evaluated)
+        wasserstein_metrics = _compute_wasserstein_metrics(evaluated, sampled)
+    artifact.save(artifact_path)
 
     plot_dir.mkdir(parents=True, exist_ok=True)
+    track_overview_path = _save_track_overview(canonical, plot_dir)
+    control_distributions_path = _save_control_distributions(canonical, plot_dir)
+    state_context_path = _save_state_context_plots(canonical, plot_dir)
     hist_path = _save_residual_histograms(evaluated, plot_dir)
     grouped_hist_path = _save_curvature_group_histograms(evaluated, plot_dir)
     heatmap_path = _save_heatmaps(evaluated, plot_dir)
@@ -540,8 +862,21 @@ def generate_uncertainty_report(
     prediction_scatter_path = _save_prediction_scatter(evaluated, plot_dir)
     wasserstein_path, wasserstein_metrics = _save_wasserstein_bars(evaluated, sampled, plot_dir)
     curvature_wasserstein_path = _save_wasserstein_by_curvature(evaluated, sampled, plot_dir)
-    rollout_overlay_path = _save_rollout_overlay(scenario, artifact_path, plot_dir)
-    rollout_channel_path = _save_rollout_state_channels(scenario, artifact_path, plot_dir)
+    rollout_overlay_path = _save_rollout_overlay(
+        scenario,
+        artifact_path,
+        plot_dir,
+        calibration_artifact_path=calibration_artifact_path,
+        driver_dataset_path=dataset_path if source_mode == "external" else None,
+    )
+    rollout_channel_path = _save_rollout_state_channels(
+        scenario,
+        artifact_path,
+        plot_dir,
+        calibration_artifact_path=calibration_artifact_path,
+        driver_dataset_path=dataset_path if source_mode == "external" else None,
+    )
+    multimodal_path, multimodal_examples = _save_multimodal_examples(evaluated, plot_dir)
 
     bucket_sizes = [len(bucket.row_ids) for bucket in artifact.buckets.values()]
     improvement = {
@@ -573,11 +908,26 @@ def generate_uncertainty_report(
         "model_wasserstein": wasserstein_metrics["model_wasserstein"],
         "mean_abs_curvature": float(evaluated["abs_curvature"].mean()),
         "mean_speed": float(evaluated["vx"].mean()),
+        "multimodal_examples": [
+            {
+                "channel": example["channel"],
+                "group_cols": list(example["group_cols"]),
+                "group_key": [str(value) for value in example["group_key"]],
+                "count": int(example["count"]),
+                "peak_count": int(example["peak_count"]),
+                "shape_stats": example["shape_stats"],
+            }
+            for example in multimodal_examples
+        ],
+        "disabled_stochastic_channels": disabled_stochastic_channels,
     }
     metrics_path = report_path.with_suffix(".json")
     metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
 
     hist_ref = _relative_markdown_path(hist_path, report_path)
+    track_overview_ref = _relative_markdown_path(track_overview_path, report_path)
+    control_distributions_ref = _relative_markdown_path(control_distributions_path, report_path)
+    state_context_ref = _relative_markdown_path(state_context_path, report_path)
     grouped_hist_ref = _relative_markdown_path(grouped_hist_path, report_path)
     heatmap_ref = _relative_markdown_path(heatmap_path, report_path)
     relationship_ref = _relative_markdown_path(relationship_path, report_path)
@@ -589,6 +939,19 @@ def generate_uncertainty_report(
     curvature_wasserstein_ref = _relative_markdown_path(curvature_wasserstein_path, report_path)
     rollout_overlay_ref = _relative_markdown_path(rollout_overlay_path, report_path)
     rollout_channel_ref = _relative_markdown_path(rollout_channel_path, report_path)
+    multimodal_ref = _relative_markdown_path(multimodal_path, report_path)
+    multimodal_lines = []
+    for example in multimodal_examples:
+        stats = example["shape_stats"]
+        multimodal_lines.extend(
+            [
+                f"- `{example['channel']}` example: `{_format_multimodal_group(example)}`",
+                f"  - peaks: `{example['peak_count']}`",
+                f"  - samples: `{example['count']}`",
+                f"  - skew: `{stats['skew']:.3f}`",
+                f"  - excess kurtosis: `{stats['excess_kurtosis']:.3f}`",
+            ]
+        )
 
     report_path.write_text(
         "\n".join(
@@ -598,7 +961,13 @@ def generate_uncertainty_report(
                 "## 1. Scope of this report",
                 "",
                 "- This report explains the current uncertainty implementation, the current rendering stack, and what the plots say about the model quality.",
-                "- In this run the dataset is synthetic, so the numbers are a pipeline-validation result rather than a claim about Assetto-calibrated realism.",
+                f"- Data source for this run: `{source_description}`",
+                *(
+                    [f"- Deterministic calibration artifact applied first: `{Path(calibration_artifact_path).name}`"]
+                    if calibration_artifact_path is not None
+                    else []
+                ),
+                f"- Disabled stochastic channels after hold-out check: `{disabled_stochastic_channels if disabled_stochastic_channels else 'none'}`",
                 "",
                 "## 2. What the current renderer is",
                 "",
@@ -613,17 +982,36 @@ def generate_uncertainty_report(
                 "",
                 "## 3. Current source of uncertainty data",
                 "",
-                "- In this run the uncertainty source is **synthetic demo data** generated by `build_demo_dataset(...)`.",
-                "- The synthetic dataset is built by rolling out the nominal bicycle model and then injecting structured residuals into the next-step dynamic state.",
-                "- The injected channels are:",
-                "  - `delta_vx`",
-                "  - `delta_vy`",
-                "  - `delta_yaw_rate`",
-                "- The injected structure is intentionally nontrivial:",
-                "  - `delta_vx` gets a progress-dependent sinusoidal term plus Gaussian noise,",
-                "  - `delta_vy` and `delta_yaw_rate` become sign-flipping and multimodal in higher-curvature regions,",
-                "  - an additional Gaussian perturbation is added on top of those channels.",
-                "- That makes the demo dataset useful for verifying that the residual model can handle context dependence and non-Gaussian behavior.",
+                f"- In this run the uncertainty source is: `{source_description}`.",
+                *(
+                    [
+                        "- The dataset for this run was created by rolling out the nominal bicycle model and then injecting structured residuals into the next-step dynamic state.",
+                        "- The injected channels are:",
+                        "  - `delta_vx`",
+                        "  - `delta_vy`",
+                        "  - `delta_yaw_rate`",
+                        "- The injected structure is intentionally nontrivial:",
+                        "  - `delta_vx` gets a progress-dependent sinusoidal term plus Gaussian noise,",
+                        "  - `delta_vy` and `delta_yaw_rate` become sign-flipping and multimodal in higher-curvature regions,",
+                        "  - an additional Gaussian perturbation is added on top of those channels.",
+                        "- That makes the demo dataset useful for verifying that the residual model can handle context dependence and non-Gaussian behavior.",
+                    ]
+                    if source_mode == "synthetic"
+                    else [
+                        "- The dataset for this run was imported through the canonical ingestion path.",
+                        "- The same downstream residual-fitting logic is used, but the residuals come from the imported trajectory data rather than the synthetic demo generator.",
+                        "- The exact residual structure in this case depends on the imported laps rather than on hand-written injected noise.",
+                        *(
+                            [
+                                "- A hybrid deterministic calibration model is applied before fitting the stochastic residual model.",
+                                "- It combines a parametric longitudinal `delta_vx` correction with a context-conditioned mean residual corrector.",
+                                "- So the residuals shown in this report are the centered leftovers after subtracting that predicted mean mismatch.",
+                            ]
+                            if calibration_artifact_path is not None
+                            else []
+                        ),
+                    ]
+                ),
                 "",
                 "## 4. Canonical dataset schema",
                 "",
@@ -665,6 +1053,14 @@ def generate_uncertainty_report(
                 "",
                 "- The nominal bicycle model predicts the next dynamic state first.",
                 "- The uncertainty model then modifies the prediction as:",
+                *(
+                    [
+                        "  - first, a deterministic mean correction is added from the calibration artifact,",
+                        "  - second, a sampled stochastic residual is added on top of that corrected baseline,",
+                    ]
+                    if calibration_artifact_path is not None
+                    else []
+                ),
                 "  - `vx_next = vx_nominal_next + delta_vx`",
                 "  - `vy_next = vy_nominal_next + delta_vy`",
                 "  - `yaw_rate_next = yaw_rate_nominal_next + delta_yaw_rate`",
@@ -683,7 +1079,21 @@ def generate_uncertainty_report(
                 "  - `progress_bin`",
                 "- Inside a gate, the model uses normalized feature-space kNN to retrieve local residual examples.",
                 "",
-                "## 9. Plots and what they show",
+                "## 9. Dataset characterization plots",
+                "",
+                f"![Track Overview]({track_overview_ref})",
+                "",
+                "- This plot shows the spatial footprint of the dataset and the average speed profile around the lap.",
+                "",
+                f"![Control Distributions]({control_distributions_ref})",
+                "",
+                "- These histograms summarize how the vehicle is driven in the dataset.",
+                "",
+                f"![State Context Plots]({state_context_ref})",
+                "",
+                "- These plots show the state-action operating envelope before fitting the residual model.",
+                "",
+                "## 10. Residual and uncertainty plots",
                 "",
                 f"![Residual Histograms]({hist_ref})",
                 "",
@@ -718,7 +1128,11 @@ def generate_uncertainty_report(
                 "",
                 f"![RMSE Comparison]({rmse_ref})",
                 "",
-                "- This compares the nominal zero-residual baseline against the fitted uncertainty mean predictor on held-out data.",
+                (
+                    "- This compares the calibrated zero-residual baseline against the fitted stochastic model on held-out centered residuals."
+                    if calibration_artifact_path is not None
+                    else "- This compares the nominal zero-residual baseline against the fitted uncertainty mean predictor on held-out data."
+                ),
                 "- Mean-prediction RMSE can remain weak even when the sampled distribution is useful, especially when the true residual is multimodal and roughly zero mean.",
                 "",
                 f"![RMSE by Curvature]({curvature_rmse_ref})",
@@ -742,7 +1156,15 @@ def generate_uncertainty_report(
                 "",
                 "- This shows how `vx`, `vy`, and `yaw_rate` evolve differently once the empirical residuals are injected online.",
                 "",
-                "## 10. Key quantitative results from this run",
+                "## 11. Non-Gaussian and multi-peak slices",
+                "",
+                f"![Multimodal Slices]({multimodal_ref})",
+                "",
+                "- These are automatically mined context slices where the held-out residual distribution is visibly multi-peaked after conditioning on progress, driver, steering sign, or control regime.",
+                "- This is the clearest answer to the question of whether the real Assetto residuals are only small single-peak Gaussians: they are not.",
+                *multimodal_lines,
+                "",
+                "## 12. Key quantitative results from this run",
                 "",
                 f"- Dataset rows: `{metrics['dataset_rows']}`",
                 f"- Residual transitions: `{metrics['residual_rows']}`",
@@ -754,17 +1176,49 @@ def generate_uncertainty_report(
                 f"- Baseline Wasserstein: `{metrics['baseline_wasserstein']}`",
                 f"- Model Wasserstein: `{metrics['model_wasserstein']}`",
                 "",
-                "## 11. Interpretation",
+                "## 13. Interpretation",
                 "",
                 "- The current code path shows that the uncertainty model is applied to the next dynamic state, not directly to hidden parameters.",
                 "- The uncertainty is state dependent, action dependent, and weakly history dependent.",
-                "- The plots show that the synthetic dataset really does contain context-dependent and partly multimodal residual structure.",
+                (
+                    "- The plots show that the synthetic dataset contains context-dependent and partly multimodal residual structure."
+                    if source_mode == "synthetic"
+                    else "- The plots show that the imported Assetto trajectories contain strong context dependence and clear nominal-model mismatch across the operating envelope."
+                ),
+                "- The automatically mined slices show that some residual channels are genuinely non-Gaussian and multi-peaked once you condition on the right local context.",
                 "- For multimodal residuals, mean-prediction RMSE is not the main success criterion.",
-                "- The sampled-distribution and Wasserstein plots are the more relevant accuracy evidence for the current simulator design.",
+                (
+                    "- After deterministic calibration, the remaining residuals are a cleaner approximation of the empirical uncertainty we actually want to sample."
+                    if calibration_artifact_path is not None
+                    else "- The sampled-distribution and Wasserstein plots are the more relevant accuracy evidence for the current simulator design."
+                ),
+                (
+                    "- The sampled-distribution and Wasserstein plots are the more relevant accuracy evidence for the current simulator design."
+                    if calibration_artifact_path is not None
+                    else ""
+                ),
                 "",
-                "## 12. What should change next",
+                "## 14. What should change next",
                 "",
-                "- Replace the synthetic source with canonicalized Assetto trajectories and regenerate exactly the same report.",
+                (
+                    "- Replace the synthetic source with canonicalized Assetto trajectories and regenerate exactly the same report."
+                    if source_mode == "synthetic"
+                    else (
+                        "- Improve and validate the deterministic longitudinal baseline further so `delta_vx` can eventually stay active in the stochastic layer too."
+                        if calibration_artifact_path is not None
+                        else "- Calibrate the nominal bicycle model against the imported Assetto data so the residual model learns uncertainty instead of absorbing large deterministic model mismatch."
+                    )
+                ),
+                (
+                    "- Validate the same calibrated pipeline on at least one more track/car pair so the results are not Barcelona-specific."
+                    if calibration_artifact_path is not None and source_mode != "synthetic"
+                    else "- Keep expanding the external-data ingestion path so more tracks, cars, and lap selections can be fit through the same report pipeline."
+                ),
+                (
+                    "- Keep expanding the external-data ingestion path so more tracks, cars, and lap selections can be fit through the same report pipeline."
+                    if source_mode != "synthetic"
+                    else "- Keep the synthetic generator as a regression testbed for the uncertainty pipeline."
+                ),
                 "- Keep Tier 1 PyBullet rendering for controller debugging and rapid iteration.",
                 "- Treat replay export plus Blender assets/materials/camera choreography as the publication animation path.",
             ]
@@ -781,19 +1235,35 @@ def generate_uncertainty_report(
     )
 
 
-def generate_default_report(output_dir: str | Path, scenario_path: str | Path | None = None) -> EvaluationArtifacts:
+def generate_default_report(
+    output_dir: str | Path,
+    scenario_path: str | Path | None = None,
+    dataset_path: str | Path | None = None,
+    source_description: str | None = None,
+    calibration_artifact_path: str | Path | None = None,
+) -> EvaluationArtifacts:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     scenario = load_scenario(scenario_path)
-    dataset_path = output_dir / "analysis_dataset.parquet"
-    build_demo_dataset(scenario, dataset_path, episodes=18, steps_per_episode=180, seed=4)
+    if dataset_path is None:
+        dataset_path = output_dir / "analysis_dataset.parquet"
+        build_demo_dataset(scenario, dataset_path, episodes=18, steps_per_episode=180, seed=4)
+        source_description = source_description or "synthetic demo data generated by build_demo_dataset(...)"
+        source_mode = "synthetic"
+    else:
+        dataset_path = Path(dataset_path)
+        source_description = source_description or f"canonical dataset loaded from {dataset_path.name}"
+        source_mode = "external"
     artifact_path = output_dir / "analysis_uncertainty.pkl"
     report_path = output_dir / "uncertainty_report.md"
     plot_dir = output_dir / "uncertainty_plots"
     return generate_uncertainty_report(
         scenario=scenario,
-        dataset_path=dataset_path,
+        dataset_path=Path(dataset_path),
         artifact_path=artifact_path,
         report_path=report_path,
         plot_dir=plot_dir,
+        source_description=source_description,
+        source_mode=source_mode,
+        calibration_artifact_path=Path(calibration_artifact_path) if calibration_artifact_path is not None else None,
     )

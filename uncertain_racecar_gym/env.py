@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 
 from uncertain_racecar_gym.common import ensure_dir
+from uncertain_racecar_gym.deterministic import load_calibration_model
 from uncertain_racecar_gym.dynamics import DynamicBicycleModel, VehicleState
 from uncertain_racecar_gym.rendering import PyBulletMirrorRenderer
 from uncertain_racecar_gym.scenario import DEFAULT_SCENARIO, Scenario, load_scenario
@@ -26,6 +27,7 @@ class UncertainRacecarEnv(gym.Env):
         scenario: str | Path | None = None,
         uncertainty: str = "nominal",
         uncertainty_artifact: str | Path | None = None,
+        calibration_artifact: str | Path | None = None,
         renderer: str | None = None,
         render_mode: str | None = None,
         output_dir: str | Path = "output",
@@ -42,8 +44,11 @@ class UncertainRacecarEnv(gym.Env):
         self.reset_rows = None
 
         self.uncertainty_model = None
+        self.calibration_model = None
         if uncertainty_artifact:
             self.uncertainty_model = EmpiricalUncertaintyModel.load(uncertainty_artifact)
+        if calibration_artifact:
+            self.calibration_model = load_calibration_model(calibration_artifact)
         self._sampler_state = self.uncertainty_model.make_runtime_state() if self.uncertainty_model else None
 
         self._history = deque(maxlen=self.scenario.uncertainty.history_length)
@@ -167,12 +172,37 @@ class UncertainRacecarEnv(gym.Env):
         action = np.asarray(action, dtype=float)
         previous_progress = self._state.progress
         feature_vector = self._feature_vector()
-        gate_key = (self.scenario.name, "demo_racecar", int(self._state.progress * self.track.progress_bins) % self.track.progress_bins)
+        progress_bin = int(self._state.progress * self.track.progress_bins) % self.track.progress_bins
+        if self.uncertainty_model is not None:
+            gate_key = self.uncertainty_model.resolve_gate_key(
+                progress_bin=progress_bin,
+                track_id=self.scenario.name,
+                car_id="demo_racecar",
+            )
+        elif self.calibration_model is not None and hasattr(self.calibration_model, "resolve_gate_key"):
+            gate_key = self.calibration_model.resolve_gate_key(
+                progress_bin=progress_bin,
+                track_id=self.scenario.name,
+                car_id="demo_racecar",
+            )
+        else:
+            gate_key = (self.scenario.name, "demo_racecar", progress_bin)
 
-        residual = None
+        residual = np.zeros(3, dtype=float)
         uncertainty_info = {"mode": self._uncertainty_mode}
+        calibration_info = None
+        if self.calibration_model is not None:
+            mean_residual, calibration_info = self.calibration_model.predict_mean(
+                feature_vector,
+                gate_key,
+                dt=float(self.scenario.simulation.dt),
+            )
+            residual = residual + mean_residual
         if self._uncertainty_mode == "empirical" and self.uncertainty_model is not None:
-            residual, uncertainty_info = self.uncertainty_model.sample(feature_vector, gate_key, self.np_random, self._sampler_state)
+            sampled_residual, uncertainty_info = self.uncertainty_model.sample(feature_vector, gate_key, self.np_random, self._sampler_state)
+            residual = residual + sampled_residual
+        elif self.calibration_model is not None:
+            uncertainty_info = {"mode": "calibrated_nominal"}
 
         self._state = self.dynamics.step(self._state, action, self.track, self.scenario.simulation.dt, residual=residual)
         self._history.append(np.array(action, dtype=float))
@@ -186,6 +216,7 @@ class UncertainRacecarEnv(gym.Env):
             "state": render_state,
             "render_state": render_state,
             "uncertainty": uncertainty_info,
+            "calibration": calibration_info,
             "lap_count": self._state.lap_count,
         }
         self._episode_history.append({**render_state, "reward": reward, "uncertainty": uncertainty_info})
