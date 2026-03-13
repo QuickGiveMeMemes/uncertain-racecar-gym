@@ -27,8 +27,11 @@ dev = [
 
 [project.scripts]
 uncertain-racecar-build-dataset = "uncertain_racecar_gym.cli:build_dataset_main"
+uncertain-racecar-build-track = "uncertain_racecar_gym.cli:build_track_main"
 uncertain-racecar-fit-uncertainty = "uncertain_racecar_gym.cli:fit_uncertainty_main"
+uncertain-racecar-calibrate-nominal = "uncertain_racecar_gym.cli:calibrate_nominal_main"
 uncertain-racecar-record-rollout = "uncertain_racecar_gym.cli:record_rollout_main"
+uncertain-racecar-compare-rollouts = "uncertain_racecar_gym.cli:compare_rollouts_main"
 uncertain-racecar-export-replay = "uncertain_racecar_gym.cli:export_replay_main"
 uncertain-racecar-analyze-uncertainty = "uncertain_racecar_gym.cli:analyze_uncertainty_main"
 
