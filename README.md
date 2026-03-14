@@ -27,6 +27,13 @@ uv sync --extra dev
 uv run pytest -q
 ```
 
+For the JAX nominal-training path:
+
+```bash
+uv sync --extra dev --extra jax
+uv run --extra jax pytest -q tests/test_jax_env.py
+```
+
 ## Clean Gym API
 
 The training-facing API keeps a standard Gymnasium `step(action)` signature.
@@ -61,6 +68,45 @@ Mode summary:
 - `uncertainty="empirical"`: empirical residual sampler from fitted data artifact
 
 Important: the RL observation stays limited to the bicycle-model state and track context. Signals like `drive_train_speed`, `rpm`, and `gear` are not exposed as policy state.
+
+## JAX nominal env
+
+There is now a partial JAX counterpart for nominal training in [jax_env.py](/Users/ktk/Desktop/mycode/uncertain-racecar-gym/uncertain_racecar_gym/jax_env.py).
+
+This JAX port currently includes:
+
+- track sampling and projection
+- nominal dynamic-bicycle rollout
+- reset / step / observation / reward / termination
+- JIT-friendly pure-state API
+
+It intentionally does not include:
+
+- PyBullet rendering
+- empirical uncertainty
+- replay/report tooling
+
+Example:
+
+```python
+import jax
+import jax.numpy as jnp
+
+from uncertain_racecar_gym.jax_env import NominalJaxRacecarEnv
+
+env = NominalJaxRacecarEnv("output/barcelona_real/ks_barcelona_layout_gp_dallara_f317.yaml")
+key = jax.random.PRNGKey(0)
+
+reset_out = env.reset(key, start_mode="random")
+state = reset_out.state
+obs = reset_out.observation
+
+action = jnp.array([0.0, 0.2, 0.0], dtype=jnp.float32)
+step_out = env.step(state, action)
+
+# JIT-friendly
+step_out = env.step_jit(state, action)
+```
 
 ## Demo workflow
 

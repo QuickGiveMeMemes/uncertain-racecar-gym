@@ -24,6 +24,9 @@ dependencies = [
 dev = [
   "pytest>=8.0,<9.0",
 ]
+jax = [
+  "jax>=0.4.35,<1.0",
+]
 
 [project.scripts]
 uncertain-racecar-build-dataset = "uncertain_racecar_gym.cli:build_dataset_main"
