@@ -12,6 +12,7 @@ from uncertain_racecar_gym.analysis import generate_default_report
 from uncertain_racecar_gym.dataset import build_canonical_dataset, build_demo_dataset
 from uncertain_racecar_gym.env import UncertainRacecarEnv
 from uncertain_racecar_gym.replay import export_replay_bundle
+from uncertain_racecar_gym.replay_eval import generate_replay_evaluation
 from uncertain_racecar_gym.rendering import PyBulletMirrorRenderer, write_video
 from uncertain_racecar_gym.scenario import load_scenario
 from uncertain_racecar_gym.track_builder import build_track_from_dataset
@@ -146,9 +147,11 @@ def record_rollout_main(argv: list[str] | None = None) -> int:
     parser.add_argument("--steps", type=int, default=200)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--render-mode", default="rgb_array_follow")
-    parser.add_argument("--uncertainty-mode", default="nominal")
+    parser.add_argument("--uncertainty-mode", default="none", choices=["none", "nominal", "gaussian", "empirical"])
     parser.add_argument("--uncertainty-artifact", default=None)
     parser.add_argument("--calibration-artifact", default=None)
+    parser.add_argument("--gaussian-mean", nargs=4, type=float, default=None, metavar=("VX", "VY", "YAW", "STEER"))
+    parser.add_argument("--gaussian-std", nargs=4, type=float, default=None, metavar=("VX", "VY", "YAW", "STEER"))
     parser.add_argument("--driver-dataset", default=None, help="Optional canonical parquet used to build a progress-dependent speed profile.")
     parser.add_argument("--speed-profile-quantile", type=float, default=0.6)
     parser.add_argument("--speed-profile-scale", type=float, default=0.6)
@@ -163,6 +166,9 @@ def record_rollout_main(argv: list[str] | None = None) -> int:
         uncertainty=args.uncertainty_mode,
         uncertainty_artifact=args.uncertainty_artifact,
         calibration_artifact=args.calibration_artifact,
+        apply_mean_correction=bool(args.calibration_artifact),
+        gaussian_noise_mean=args.gaussian_mean,
+        gaussian_noise_std=args.gaussian_std,
         renderer="pybullet",
         render_mode=args.render_mode,
         output_dir=output_dir,
@@ -174,7 +180,15 @@ def record_rollout_main(argv: list[str] | None = None) -> int:
         target_speed=args.target_speed,
         min_speed=args.min_speed,
     )
-    obs, info = env.reset(seed=args.seed, options={"uncertainty_mode": args.uncertainty_mode, "start_mode": "random"})
+    obs, info = env.reset(
+        seed=args.seed,
+        options={
+            "uncertainty_mode": args.uncertainty_mode,
+            "gaussian_noise_mean": args.gaussian_mean,
+            "gaussian_noise_std": args.gaussian_std,
+            "start_mode": "random",
+        },
+    )
 
     frames = []
     rewards = []
@@ -237,8 +251,9 @@ def compare_rollouts_main(argv: list[str] | None = None) -> int:
     scenario = load_scenario(args.scenario)
     nominal = UncertainRacecarEnv(
         scenario=scenario.source_path,
-        uncertainty="nominal",
+        uncertainty=None,
         calibration_artifact=args.calibration_artifact,
+        apply_mean_correction=bool(args.calibration_artifact),
         renderer=None,
         render_mode=None,
         output_dir=output_dir,
@@ -248,6 +263,7 @@ def compare_rollouts_main(argv: list[str] | None = None) -> int:
         uncertainty="empirical",
         uncertainty_artifact=args.uncertainty_artifact,
         calibration_artifact=args.calibration_artifact,
+        apply_mean_correction=bool(args.calibration_artifact),
         renderer=None,
         render_mode=None,
         output_dir=output_dir,
@@ -259,7 +275,7 @@ def compare_rollouts_main(argv: list[str] | None = None) -> int:
         target_speed=args.target_speed,
         min_speed=args.min_speed,
     )
-    nominal.reset(seed=args.seed, options={"uncertainty_mode": "nominal", "start_mode": "random"})
+    nominal.reset(seed=args.seed, options={"uncertainty_mode": None, "start_mode": "random"})
     empirical.reset(seed=args.seed, options={"uncertainty_mode": "empirical", "start_mode": "random"})
 
     renderer = PyBulletMirrorRenderer(scenario, nominal.track, args.render_mode)
@@ -341,6 +357,30 @@ def analyze_uncertainty_main(argv: list[str] | None = None) -> int:
         dataset_path=args.dataset,
         source_description=args.source_description,
         calibration_artifact_path=args.calibration_artifact,
+    )
+    print(artifacts.report_path)
+    return 0
+
+
+def replay_evaluate_main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Replay recorded Assetto actions and compare actual data against nominal, calibrated, and empirical rollouts.")
+    parser.add_argument("--scenario", default=None)
+    parser.add_argument("--dataset", required=True)
+    parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--calibration-artifact", default=None)
+    parser.add_argument("--uncertainty-artifact", default=None)
+    parser.add_argument("--trajectory-limit", type=int, default=2)
+    parser.add_argument("--empirical-seeds", nargs="*", type=int, default=[11, 17, 23, 29])
+    args = parser.parse_args(argv)
+
+    artifacts = generate_replay_evaluation(
+        dataset_path=args.dataset,
+        scenario_path=args.scenario,
+        output_dir=args.output_dir,
+        calibration_artifact_path=args.calibration_artifact,
+        uncertainty_artifact_path=args.uncertainty_artifact,
+        trajectory_limit=args.trajectory_limit,
+        empirical_seeds=tuple(args.empirical_seeds),
     )
     print(artifacts.report_path)
     return 0

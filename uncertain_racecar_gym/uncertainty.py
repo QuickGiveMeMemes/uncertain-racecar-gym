@@ -11,21 +11,81 @@ from scipy.spatial import cKDTree
 
 from uncertain_racecar_gym.common import softmax_sample_weights
 from uncertain_racecar_gym.dynamics import DynamicBicycleModel
+from uncertain_racecar_gym.features import FEATURE_NAMES, build_feature_vector_from_row, feature_value, history_means_from_feature_vector
 from uncertain_racecar_gym.scenario import Scenario
 from uncertain_racecar_gym.track import TrackModel
 
-
-FEATURE_NAMES = [
-    "curvature",
-    "progress",
-    "vx",
-    "vy",
-    "yaw_rate",
-    "steer",
-    "throttle",
-    "brake",
-]
 RESIDUAL_NAMES = ["delta_vx", "delta_vy", "delta_yaw_rate"]
+
+
+def regime_key_from_feature_vector(feature_vector: np.ndarray) -> str:
+    curvature = feature_value(feature_vector, "curvature")
+    vx = feature_value(feature_vector, "vx")
+    vy = feature_value(feature_vector, "vy")
+    yaw_rate = feature_value(feature_vector, "yaw_rate")
+    steer = feature_value(feature_vector, "steer")
+    throttle = feature_value(feature_vector, "throttle")
+    brake = feature_value(feature_vector, "brake")
+    speed_gap = feature_value(feature_vector, "speed_gap")
+    rear_slip_ratio = feature_value(feature_vector, "rear_slip_ratio_mean")
+    rear_slip_angle = feature_value(feature_vector, "rear_slip_angle_mean")
+    tc_active = feature_value(feature_vector, "tc_active")
+    abs_active = feature_value(feature_vector, "abs_active")
+    gear_norm = feature_value(feature_vector, "gear_norm")
+    history_steer, history_throttle, history_brake = history_means_from_feature_vector(feature_vector)
+
+    effective_throttle = max(float(throttle), history_throttle)
+    effective_brake = max(float(brake), history_brake)
+    if abs_active > 0.5 or effective_brake > 0.20 or rear_slip_ratio < -0.14:
+        control = "brake_hard"
+    elif effective_brake > 0.06:
+        control = "brake"
+    elif tc_active > 0.5 or rear_slip_ratio > 0.14 or speed_gap > 2.0:
+        control = "traction_limited"
+    elif effective_throttle > 0.75:
+        control = "power_high"
+    elif effective_throttle > 0.22:
+        control = "power_mid"
+    else:
+        control = "coast"
+
+    if vx < 12.0:
+        speed = "slow"
+    elif vx < 25.0:
+        speed = "medium"
+    elif vx < 40.0:
+        speed = "fast"
+    else:
+        speed = "very_fast"
+    if gear_norm > 0.82 and speed in {"fast", "very_fast"}:
+        speed = "top_gear"
+
+    turn_metric = max(
+        abs(float(steer)),
+        abs(history_steer),
+        min(1.0, abs(float(curvature)) * 120.0),
+        min(1.0, abs(float(vy)) / 3.0),
+        min(1.0, abs(float(yaw_rate)) / 1.5),
+        min(1.0, abs(float(rear_slip_angle)) / 0.16),
+    )
+    corner = "corner" if turn_metric > 0.10 else "straight"
+    if float(steer) < -0.03 or float(curvature) < -0.004:
+        direction = "left"
+    elif float(steer) > 0.03 or float(curvature) > 0.004:
+        direction = "right"
+    else:
+        direction = "straight"
+
+    if rear_slip_ratio > 0.12:
+        slip = "rear_push"
+    elif rear_slip_ratio < -0.12:
+        slip = "rear_drag"
+    elif abs(rear_slip_angle) > 0.08:
+        slip = "rear_angle"
+    else:
+        slip = "rear_settled"
+
+    return f"{control}|{speed}|{corner}|{direction}|{slip}"
 
 
 @dataclass(slots=True)
@@ -44,9 +104,12 @@ class Bucket:
     trajectory_ids: np.ndarray
     frame_indices: np.ndarray
     mode_keys: np.ndarray
+    regime_keys: np.ndarray
     tree: cKDTree | None = None
     mode_indices: dict[str, np.ndarray] | None = None
     mode_trees: dict[str, cKDTree] | None = None
+    regime_indices: dict[str, np.ndarray] | None = None
+    regime_trees: dict[str, cKDTree] | None = None
 
 
 def _mode_key_from_trajectory_id(trajectory_id: str) -> str:
@@ -67,6 +130,7 @@ class EmpiricalUncertaintyModel:
         gate_rows: list[tuple[str, str, int]],
         trajectory_ids: list[str],
         mode_keys: list[str],
+        regime_keys: list[str],
         frame_indices: list[int],
         continuation_map: dict[int, int],
         history_length: int,
@@ -85,6 +149,7 @@ class EmpiricalUncertaintyModel:
         residual_matrix = np.asarray(residual_rows, dtype=float)
         trajectory_array = np.asarray(trajectory_ids, dtype=object)
         mode_key_array = np.asarray(mode_keys, dtype=object)
+        regime_key_array = np.asarray(regime_keys, dtype=object)
         frame_array = np.asarray(frame_indices, dtype=int)
         for gate in sorted(set(gate_rows)):
             mask = np.array([candidate == gate for candidate in gate_rows], dtype=bool)
@@ -96,6 +161,7 @@ class EmpiricalUncertaintyModel:
                 trajectory_ids=trajectory_array[mask],
                 frame_indices=frame_array[mask],
                 mode_keys=mode_key_array[mask],
+                regime_keys=regime_key_array[mask],
             )
 
         return EmpiricalUncertaintyModel(
@@ -119,6 +185,8 @@ class EmpiricalUncertaintyModel:
         feature_std: np.ndarray,
         buckets: dict[tuple[str, str, int], Bucket],
         continuation_map: dict[int, int],
+        global_channel_mask: np.ndarray | None = None,
+        regime_channel_masks: dict[str, np.ndarray] | None = None,
     ):
         self.history_length = history_length
         self.neighbor_count = neighbor_count
@@ -128,6 +196,15 @@ class EmpiricalUncertaintyModel:
         self.feature_std = feature_std
         self.buckets = buckets
         self.continuation_map = continuation_map
+        self.global_channel_mask = (
+            np.asarray(global_channel_mask, dtype=bool).copy()
+            if global_channel_mask is not None
+            else np.ones(len(RESIDUAL_NAMES), dtype=bool)
+        )
+        self.regime_channel_masks = {
+            str(key): np.asarray(value, dtype=bool).copy()
+            for key, value in (regime_channel_masks or {}).items()
+        }
         self._gate_prefixes = sorted({(gate[0], gate[1]) for gate in buckets})
         self._row_lookup = {}
         self._rebuild_indexes()
@@ -138,11 +215,18 @@ class EmpiricalUncertaintyModel:
             bucket.tree = cKDTree(bucket.features) if len(bucket.features) else None
             bucket.mode_indices = {}
             bucket.mode_trees = {}
+            bucket.regime_indices = {}
+            bucket.regime_trees = {}
             for mode_key in sorted(set(bucket.mode_keys.tolist())):
                 local_indices = np.flatnonzero(bucket.mode_keys == mode_key)
                 bucket.mode_indices[str(mode_key)] = local_indices
                 if len(local_indices):
                     bucket.mode_trees[str(mode_key)] = cKDTree(bucket.features[local_indices])
+            for regime_key in sorted(set(bucket.regime_keys.tolist())):
+                local_indices = np.flatnonzero(bucket.regime_keys == regime_key)
+                bucket.regime_indices[str(regime_key)] = local_indices
+                if len(local_indices):
+                    bucket.regime_trees[str(regime_key)] = cKDTree(bucket.features[local_indices])
             for index, row_id in enumerate(bucket.row_ids):
                 self._row_lookup[int(row_id)] = (gate, index)
 
@@ -169,6 +253,7 @@ class EmpiricalUncertaintyModel:
         row_ids = []
         trajectory_ids = []
         mode_keys = []
+        regime_keys = []
         frame_indices = []
         continuation_map = {}
 
@@ -183,23 +268,11 @@ class EmpiricalUncertaintyModel:
                 action = np.array([current["steer"], current["throttle"], current["brake"]], dtype=float)
                 state = model.state_from_canonical_row(current)
                 prediction = model.predict(state, action, float(current["dt"]))
-                feature_vector = np.concatenate(
-                    [
-                        np.array(
-                            [
-                                current["curvature"],
-                                current["progress"],
-                                current["vx"],
-                                current["vy"],
-                                current["yaw_rate"],
-                                current["steer"],
-                                current["throttle"],
-                                current["brake"],
-                            ],
-                            dtype=float,
-                        ),
-                        np.array(action_history, dtype=float).reshape(-1),
-                    ]
+                feature_vector = build_feature_vector_from_row(
+                    current,
+                    action_history=action_history,
+                    vehicle_config=scenario.vehicle,
+                    previous_row=group.iloc[index - 1] if index > 0 else None,
                 )
                 residual_vector = np.array(
                     [
@@ -221,6 +294,7 @@ class EmpiricalUncertaintyModel:
                 row_ids.append(global_row_id)
                 trajectory_ids.append(str(current["trajectory_id"]))
                 mode_keys.append(_mode_key_from_trajectory_id(str(current["trajectory_id"])))
+                regime_keys.append(regime_key_from_feature_vector(feature_vector))
                 frame_indices.append(int(current["frame_index"]))
 
                 if previous_row_id is not None:
@@ -237,6 +311,7 @@ class EmpiricalUncertaintyModel:
             gate_rows=gate_rows,
             trajectory_ids=trajectory_ids,
             mode_keys=mode_keys,
+            regime_keys=regime_keys,
             frame_indices=frame_indices,
             continuation_map=continuation_map,
             history_length=history_length,
@@ -272,6 +347,7 @@ class EmpiricalUncertaintyModel:
         ]
         trajectory_ids = [str(value) for value in ordered["trajectory_id"].tolist()]
         mode_keys = [_mode_key_from_trajectory_id(value) for value in trajectory_ids]
+        regime_keys = [regime_key_from_feature_vector(vector) for vector in feature_rows]
         frame_indices = [int(value) for value in ordered["frame_index"].tolist()]
 
         continuation_map: dict[int, int] = {}
@@ -290,6 +366,7 @@ class EmpiricalUncertaintyModel:
             gate_rows=gate_rows,
             trajectory_ids=trajectory_ids,
             mode_keys=mode_keys,
+            regime_keys=regime_keys,
             frame_indices=frame_indices,
             continuation_map=continuation_map,
             history_length=history_length,
@@ -343,6 +420,50 @@ class EmpiricalUncertaintyModel:
                 return bucket
         return next(iter(self.buckets.values()), None)
 
+    def _candidate_pool(
+        self,
+        bucket: Bucket,
+        feature_vector: np.ndarray,
+        runtime_state: SamplerRuntimeState | None = None,
+    ) -> tuple[np.ndarray, cKDTree | None, str, str]:
+        regime_key = regime_key_from_feature_vector(feature_vector)
+        candidate_indices = np.arange(len(bucket.features), dtype=int)
+        candidate_tree = bucket.tree
+        scope = "full"
+
+        regime_indices = None if bucket.regime_indices is None else bucket.regime_indices.get(regime_key)
+        mode_indices = None
+        if runtime_state is not None and runtime_state.active_mode_key is not None and bucket.mode_indices is not None:
+            mode_indices = bucket.mode_indices.get(runtime_state.active_mode_key)
+
+        minimum_subset = max(8, min(self.neighbor_count, 16))
+        if regime_indices is not None and mode_indices is not None:
+            combo = np.intersect1d(regime_indices, mode_indices, assume_unique=False)
+            if len(combo) >= minimum_subset:
+                return combo, cKDTree(bucket.features[combo]), regime_key, "mode_regime"
+        if regime_indices is not None and len(regime_indices) >= minimum_subset and bucket.regime_trees is not None:
+            return regime_indices, bucket.regime_trees[regime_key], regime_key, "regime"
+        if mode_indices is not None and len(mode_indices) >= minimum_subset and bucket.mode_trees is not None:
+            return mode_indices, bucket.mode_trees[runtime_state.active_mode_key], regime_key, "mode"
+        return candidate_indices, candidate_tree, regime_key, scope
+
+    def _channel_mask(self, regime_key: str) -> np.ndarray:
+        return self.regime_channel_masks.get(regime_key, self.global_channel_mask).astype(float)
+
+    def with_channel_masks(
+        self,
+        global_channel_mask: np.ndarray | None = None,
+        regime_channel_masks: dict[str, np.ndarray] | None = None,
+    ) -> "EmpiricalUncertaintyModel":
+        if global_channel_mask is not None:
+            self.global_channel_mask = np.asarray(global_channel_mask, dtype=bool).copy()
+        if regime_channel_masks is not None:
+            self.regime_channel_masks = {
+                str(key): np.asarray(value, dtype=bool).copy()
+                for key, value in regime_channel_masks.items()
+            }
+        return self
+
     def sample(
         self,
         feature_vector: np.ndarray,
@@ -352,6 +473,7 @@ class EmpiricalUncertaintyModel:
     ) -> tuple[np.ndarray, dict]:
         if not self.buckets:
             return np.zeros(3, dtype=float), {"mode": "empty"}
+        current_regime_key = regime_key_from_feature_vector(feature_vector)
 
         if runtime_state.remaining_block > 0 and runtime_state.active_row_id in self.continuation_map:
             next_row_id = self.continuation_map[runtime_state.active_row_id]
@@ -361,11 +483,14 @@ class EmpiricalUncertaintyModel:
                 runtime_state.active_row_id = next_row_id
                 runtime_state.remaining_block -= 1
                 runtime_state.active_mode_key = str(bucket.mode_keys[local_index])
-                return bucket.residuals[local_index], {
+                return bucket.residuals[local_index] * self._channel_mask(current_regime_key), {
                     "mode": "block",
                     "row_id": int(next_row_id),
                     "gate": gate,
                     "mode_key": runtime_state.active_mode_key,
+                    "regime_key": current_regime_key,
+                    "candidate_scope": "block",
+                    "channel_mask": self._channel_mask(current_regime_key).astype(int).tolist(),
                 }
 
         normalized = (feature_vector - self.feature_mean) / self.feature_std
@@ -373,17 +498,11 @@ class EmpiricalUncertaintyModel:
         if bucket is None or bucket.tree is None:
             return np.zeros(3, dtype=float), {"mode": "fallback"}
 
-        candidate_tree = bucket.tree
-        candidate_indices = np.arange(len(bucket.features), dtype=int)
-        if (
-            runtime_state.active_mode_key is not None
-            and bucket.mode_indices is not None
-            and bucket.mode_trees is not None
-            and runtime_state.active_mode_key in bucket.mode_indices
-            and len(bucket.mode_indices[runtime_state.active_mode_key]) >= max(16, self.neighbor_count // 2)
-        ):
-            candidate_indices = bucket.mode_indices[runtime_state.active_mode_key]
-            candidate_tree = bucket.mode_trees[runtime_state.active_mode_key]
+        candidate_indices, candidate_tree, current_regime_key, candidate_scope = self._candidate_pool(
+            bucket,
+            feature_vector,
+            runtime_state=runtime_state,
+        )
 
         query_k = min(self.neighbor_count, len(candidate_indices))
         distances, local_indices = candidate_tree.query(normalized, k=query_k)
@@ -396,13 +515,17 @@ class EmpiricalUncertaintyModel:
         runtime_state.active_row_id = row_id
         runtime_state.remaining_block = int(rng.integers(1, self.block_length + 1))
         runtime_state.active_mode_key = str(bucket.mode_keys[choice_index])
-        return bucket.residuals[choice_index], {
+        sampled = bucket.residuals[choice_index] * self._channel_mask(current_regime_key)
+        return sampled, {
             "mode": "knn",
             "row_id": row_id,
             "gate": bucket.gate,
             "mode_key": runtime_state.active_mode_key,
+            "regime_key": current_regime_key,
+            "candidate_scope": candidate_scope,
             "distance_mean": float(distances.mean()),
             "sample_weight": float(weights[np.where(indices == choice_index)[0][0]]),
+            "channel_mask": self._channel_mask(current_regime_key).astype(int).tolist(),
         }
 
     def predict_mean(
@@ -418,17 +541,22 @@ class EmpiricalUncertaintyModel:
             return np.zeros(3, dtype=float), {"mode": "fallback"}
 
         normalized = (feature_vector - self.feature_mean) / self.feature_std
-        query_k = min(self.neighbor_count, len(bucket.features))
-        distances, indices = bucket.tree.query(normalized, k=query_k)
+        candidate_indices, candidate_tree, current_regime_key, candidate_scope = self._candidate_pool(bucket, feature_vector)
+        query_k = min(self.neighbor_count, len(candidate_indices))
+        distances, indices = candidate_tree.query(normalized, k=query_k)
         distances = np.atleast_1d(distances).astype(float)
         indices = np.atleast_1d(indices).astype(int)
+        local_indices = candidate_indices[indices]
         weights = softmax_sample_weights(distances)
-        mean_residual = np.average(bucket.residuals[indices], axis=0, weights=weights)
+        mean_residual = np.average(bucket.residuals[local_indices], axis=0, weights=weights) * self._channel_mask(current_regime_key)
         return mean_residual, {
             "mode": "knn_mean",
             "gate": bucket.gate,
+            "regime_key": current_regime_key,
+            "candidate_scope": candidate_scope,
             "distance_mean": float(distances.mean()),
             "neighbors": int(query_k),
+            "channel_mask": self._channel_mask(current_regime_key).astype(int).tolist(),
         }
 
     def to_payload(self) -> dict:
@@ -440,6 +568,8 @@ class EmpiricalUncertaintyModel:
             "feature_mean": self.feature_mean,
             "feature_std": self.feature_std,
             "continuation_map": self.continuation_map,
+            "global_channel_mask": self.global_channel_mask,
+            "regime_channel_masks": self.regime_channel_masks,
             "buckets": {
                 gate: {
                     "features": bucket.features,
@@ -448,6 +578,7 @@ class EmpiricalUncertaintyModel:
                     "trajectory_ids": bucket.trajectory_ids,
                     "frame_indices": bucket.frame_indices,
                     "mode_keys": bucket.mode_keys,
+                    "regime_keys": bucket.regime_keys,
                 }
                 for gate, bucket in self.buckets.items()
             },
@@ -467,6 +598,9 @@ class EmpiricalUncertaintyModel:
         channel_indices = [RESIDUAL_NAMES.index(name) for name in channel_names]
         for bucket in self.buckets.values():
             bucket.residuals[:, channel_indices] = 0.0
+        self.global_channel_mask[channel_indices] = False
+        for regime_key in list(self.regime_channel_masks):
+            self.regime_channel_masks[regime_key][channel_indices] = False
         return self
 
     @classmethod
@@ -483,6 +617,10 @@ class EmpiricalUncertaintyModel:
                     "mode_keys",
                     np.asarray([_mode_key_from_trajectory_id(value) for value in data["trajectory_ids"]], dtype=object),
                 ),
+                regime_keys=data.get(
+                    "regime_keys",
+                    np.asarray(["unknown"] * len(data["row_ids"]), dtype=object),
+                ),
             )
             for gate, data in payload["buckets"].items()
         }
@@ -495,6 +633,8 @@ class EmpiricalUncertaintyModel:
             feature_std=payload["feature_std"],
             buckets=buckets,
             continuation_map=payload["continuation_map"],
+            global_channel_mask=payload.get("global_channel_mask"),
+            regime_channel_masks=payload.get("regime_channel_masks"),
         )
 
     @classmethod

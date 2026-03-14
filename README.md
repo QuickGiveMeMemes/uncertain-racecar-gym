@@ -18,7 +18,7 @@ The current saved MP4s are **Tier 1 diagnostic renders**, not the final publicat
   - replay export for offline scene work
   - intended path for publication-ready animation quality
 
-For a deeper explanation of the current renderer quality gap and the uncertainty model itself, see [UNCERTAINTY_TECHNICAL_README.md](/Users/ktk/Desktop/mycode/uncertain-racecar-gym/UNCERTAINTY_TECHNICAL_README.md). For the latest calibrated real-data review package, start with [phase_9_cross_track_uncertainty_and_renderer.md](/Users/ktk/Desktop/mycode/uncertain-racecar-gym/output/phase_9_cross_track_uncertainty_and_renderer.md).
+For a deeper explanation of the current renderer quality gap and the uncertainty model itself, see [UNCERTAINTY_TECHNICAL_README.md](/Users/ktk/Desktop/mycode/uncertain-racecar-gym/UNCERTAINTY_TECHNICAL_README.md). For the latest telemetry-conditioned real-data review package, start with [phase_12_telemetry_and_replay_eval.md](/Users/ktk/Desktop/mycode/uncertain-racecar-gym/output/phase_12_telemetry_and_replay_eval.md).
 
 ## Quick start
 
@@ -26,6 +26,41 @@ For a deeper explanation of the current renderer quality gap and the uncertainty
 uv sync --extra dev
 uv run pytest -q
 ```
+
+## Clean Gym API
+
+The training-facing API keeps a standard Gymnasium `step(action)` signature.
+
+Switch uncertainty with the env constructor, `reset(options=...)`, or `env.unwrapped.set_uncertainty(...)`:
+
+```python
+import gymnasium as gym
+import uncertain_racecar_gym  # registers UncertainRacecar-v0
+
+env = gym.make("UncertainRacecar-v0", uncertainty=None)
+obs, info = env.reset(seed=0)
+
+# Pure nominal rollout
+obs, reward, terminated, truncated, info = env.step(action)
+
+# Switch to fixed Gaussian uncertainty on [delta_vx, delta_vy, delta_yaw_rate, delta_steer]
+env.unwrapped.set_uncertainty("gaussian", gaussian_noise_std=[0.12, 0.08, 0.05, 0.015])
+
+# Switch to empirical uncertainty
+env = gym.make(
+    "UncertainRacecar-v0",
+    uncertainty="empirical",
+    uncertainty_artifact="path/to/analysis_uncertainty.pkl",
+)
+```
+
+Mode summary:
+
+- `uncertainty=None` or `"nominal"`: pure dynamic-bicycle rollout
+- `uncertainty="gaussian"`: zero-mean Gaussian perturbation on modeled dynamic states
+- `uncertainty="empirical"`: empirical residual sampler from fitted data artifact
+
+Important: the RL observation stays limited to the bicycle-model state and track context. Signals like `drive_train_speed`, `rpm`, and `gear` are not exposed as policy state.
 
 ## Demo workflow
 
@@ -54,7 +89,15 @@ uv run uncertain-racecar-record-rollout \
   --name nominal_rollout \
   --steps 140 \
   --render-mode rgb_array_follow \
-  --uncertainty-mode nominal
+  --uncertainty-mode none
+
+uv run uncertain-racecar-record-rollout \
+  --output-dir output \
+  --name gaussian_rollout \
+  --steps 140 \
+  --render-mode rgb_array_follow \
+  --uncertainty-mode gaussian \
+  --gaussian-std 0.12 0.08 0.05 0.015
 
 uv run uncertain-racecar-record-rollout \
   --output-dir output \
@@ -78,6 +121,17 @@ Generate the uncertainty analysis report with plots:
 
 ```bash
 uv run uncertain-racecar-analyze-uncertainty --output-dir output
+```
+
+Replay recorded actions against actual data:
+
+```bash
+uv run uncertain-racecar-replay-evaluate \
+  --scenario output/barcelona_real/ks_barcelona_layout_gp_dallara_f317.yaml \
+  --dataset output/barcelona_telemetry_real/barcelona_real_canonical.parquet \
+  --output-dir output/barcelona_telemetry_regime_calibrated/replay_eval \
+  --calibration-artifact output/barcelona_telemetry_regime_calibrated/nominal_calibration.pkl \
+  --uncertainty-artifact output/barcelona_telemetry_regime_calibrated/stochastic_report/analysis_uncertainty.pkl
 ```
 
 ## Assetto-style ingestion
@@ -158,12 +212,14 @@ The current example outputs from that workflow are already available here:
 - [phase_7_calibrated_nominal_and_ghost_compare.md](/Users/ktk/Desktop/mycode/uncertain-racecar-gym/output/phase_7_calibrated_nominal_and_ghost_compare.md)
 - [phase_8_hybrid_longitudinal_calibration.md](/Users/ktk/Desktop/mycode/uncertain-racecar-gym/output/phase_8_hybrid_longitudinal_calibration.md)
 - [phase_9_cross_track_uncertainty_and_renderer.md](/Users/ktk/Desktop/mycode/uncertain-racecar-gym/output/phase_9_cross_track_uncertainty_and_renderer.md)
+- [phase_10_regime_conditioned_uncertainty.md](/Users/ktk/Desktop/mycode/uncertain-racecar-gym/output/phase_10_regime_conditioned_uncertainty.md)
+- [phase_11_trajectory_id_fix.md](/Users/ktk/Desktop/mycode/uncertain-racecar-gym/output/phase_11_trajectory_id_fix.md)
+- [phase_12_telemetry_and_replay_eval.md](/Users/ktk/Desktop/mycode/uncertain-racecar-gym/output/phase_12_telemetry_and_replay_eval.md)
 - [track_report.md](/Users/ktk/Desktop/mycode/uncertain-racecar-gym/output/barcelona_real/track_report/track_report.md)
-- [uncertainty_report.md](/Users/ktk/Desktop/mycode/uncertain-racecar-gym/output/barcelona_real/report/uncertainty_report.md)
-- [corrected uncertainty_report.md](/Users/ktk/Desktop/mycode/uncertain-racecar-gym/output/barcelona_real_dtfix/report/uncertainty_report.md)
-- [calibrated uncertainty_report.md](/Users/ktk/Desktop/mycode/uncertain-racecar-gym/output/barcelona_calibrated/stochastic_report/uncertainty_report.md)
-- [hybrid calibrated uncertainty_report.md](/Users/ktk/Desktop/mycode/uncertain-racecar-gym/output/barcelona_hybrid_calibrated/stochastic_report/uncertainty_report.md)
-- [Monza hybrid calibrated uncertainty_report.md](/Users/ktk/Desktop/mycode/uncertain-racecar-gym/output/monza_hybrid_calibrated/stochastic_report/uncertainty_report.md)
+- [telemetry-conditioned Barcelona uncertainty_report.md](/Users/ktk/Desktop/mycode/uncertain-racecar-gym/output/barcelona_telemetry_regime_calibrated/stochastic_report/uncertainty_report.md)
+- [telemetry-conditioned Monza uncertainty_report.md](/Users/ktk/Desktop/mycode/uncertain-racecar-gym/output/monza_telemetry_regime_calibrated/stochastic_report/uncertainty_report.md)
+- [Barcelona replay_eval_report.md](/Users/ktk/Desktop/mycode/uncertain-racecar-gym/output/barcelona_telemetry_regime_calibrated/replay_eval/replay_eval_report.md)
+- [Monza replay_eval_report.md](/Users/ktk/Desktop/mycode/uncertain-racecar-gym/output/monza_telemetry_regime_calibrated/replay_eval/replay_eval_report.md)
 
 ## Project layout
 

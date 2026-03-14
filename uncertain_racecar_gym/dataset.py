@@ -12,6 +12,7 @@ import pandas as pd
 from uncertain_racecar_gym.common import ensure_dir
 from uncertain_racecar_gym.controllers import CenterlineDriver
 from uncertain_racecar_gym.dynamics import DynamicBicycleModel
+from uncertain_racecar_gym.features import TELEMETRY_CANONICAL_COLUMNS, rear_slip_angle_proxy, runtime_telemetry_proxy
 from uncertain_racecar_gym.scenario import Scenario, load_scenario
 from uncertain_racecar_gym.track import TrackModel
 
@@ -36,6 +37,7 @@ CANONICAL_COLUMNS = [
     "throttle",
     "brake",
     "wheel_rotation",
+    *TELEMETRY_CANONICAL_COLUMNS,
     "lap_count",
 ]
 
@@ -150,6 +152,21 @@ def _metadata_from_path(path: Path) -> dict[str, str]:
     return {}
 
 
+def _trajectory_id_from_path(path: Path) -> str:
+    parts = list(path.parts)
+    if "data_sets" in parts:
+        index = parts.index("data_sets")
+        relative_parts = parts[index + 3 :]
+        if relative_parts:
+            cleaned = [part for part in relative_parts[:-1] if part and part != "laps"]
+            cleaned.append(Path(relative_parts[-1]).stem)
+            return "__".join(cleaned)
+    parent_name = path.parent.name.strip()
+    if parent_name and parent_name != ".":
+        return f"{parent_name}__{path.stem}"
+    return path.stem
+
+
 def _normalize_time_seconds(df: pd.DataFrame) -> pd.Series:
     if "t" in df:
         return df["t"].astype(float)
@@ -243,6 +260,47 @@ def _load_records(input_path: Path) -> pd.DataFrame:
     return load_records(input_path).frame
 
 
+def _missing_numeric_series(length: int, value: float = np.nan) -> pd.Series:
+    return pd.Series(np.full(length, value, dtype=float), dtype=float)
+
+
+def _numeric_series(df: pd.DataFrame, names: list[str], default: float = np.nan) -> pd.Series:
+    for name in names:
+        if name in df:
+            return pd.to_numeric(df[name], errors="coerce").astype(float)
+    return _missing_numeric_series(len(df), value=default)
+
+
+def _mean_available(series_list: list[pd.Series]) -> pd.Series:
+    if not series_list:
+        return _missing_numeric_series(0)
+    frame = pd.concat([series.astype(float) for series in series_list], axis=1)
+    return frame.mean(axis=1, skipna=True).astype(float)
+
+
+def _binary_series(df: pd.DataFrame, names: list[str]) -> pd.Series:
+    series = _numeric_series(df, names, default=np.nan)
+    if series.notna().any():
+        return series.fillna(0.0).clip(0.0, 1.0).astype(float)
+    return _missing_numeric_series(len(df), value=np.nan)
+
+
+def _normalize_drive_train_speed(series: pd.Series, reference_vx: pd.Series) -> pd.Series:
+    values = pd.to_numeric(series, errors="coerce").astype(float)
+    finite_mask = np.isfinite(values.to_numpy(dtype=float))
+    if not finite_mask.any():
+        return values
+
+    vx = reference_vx.abs().to_numpy(dtype=float)
+    speed = np.abs(values.to_numpy(dtype=float))
+    valid = finite_mask & np.isfinite(vx) & (vx > 1.0)
+    if valid.any():
+        ratio = float(np.median(speed[valid] / np.maximum(vx[valid], 1e-6)))
+        if ratio > 2.2:
+            values = values / 3.6
+    return values.astype(float)
+
+
 def _resolve_ids(track_id: str | None, car_id: str | None, metadata: dict[str, str], fallback_track_id: str) -> tuple[str, str]:
     resolved_track_id = _sanitize_identifier(track_id or metadata.get("track_id"), fallback_track_id)
     resolved_car_id = _sanitize_identifier(car_id or metadata.get("car_id"), "assetto_car")
@@ -251,6 +309,14 @@ def _resolve_ids(track_id: str | None, car_id: str | None, metadata: dict[str, s
 
 def _fill_metadata_columns(canonical: pd.DataFrame, track_id: str, car_id: str, trajectory_id: str) -> pd.DataFrame:
     canonical = canonical.copy()
+    for column in CANONICAL_COLUMNS:
+        if column not in canonical.columns:
+            if column in {"trajectory_id", "track_id", "car_id"}:
+                canonical[column] = ""
+            elif column in {"frame_index", "lap_count"}:
+                canonical[column] = 0
+            else:
+                canonical[column] = np.nan
     canonical["track_id"] = canonical["track_id"].replace("", pd.NA).fillna(track_id)
     canonical["car_id"] = canonical["car_id"].replace("", pd.NA).fillna(car_id)
     canonical["trajectory_id"] = canonical["trajectory_id"].replace("", pd.NA).fillna(trajectory_id)
@@ -281,6 +347,29 @@ def canonicalize_dataframe(
     steer = _normalize_steer(df.get("steerAngle", df.get("steer", pd.Series(np.zeros(len(df)))))).astype(float)
     throttle = df.get("accStatus", df.get("throttle", pd.Series(np.zeros(len(df))))).astype(float).clip(0.0, 1.0)
     brake = df.get("brakeStatus", df.get("brake", pd.Series(np.zeros(len(df))))).astype(float).clip(0.0, 1.0)
+    accel_x = _numeric_series(df, ["accel_x", "accelX"])
+    accel_y = _numeric_series(df, ["accel_y", "accelY"])
+    drive_train_speed = _normalize_drive_train_speed(_numeric_series(df, ["drive_train_speed", "drive train speed"]), vx)
+    rpm = _numeric_series(df, ["rpm", "RPM"])
+    gear = _numeric_series(df, ["gear", "actualGear"])
+    rear_slip_ratio = _mean_available(
+        [
+            _numeric_series(df, ["rear_slip_ratio_mean"]),
+            _numeric_series(df, ["rear_slip_ratio"]),
+            _numeric_series(df, ["tyre_slip_ratio_rl", "SlipRatio_rl"]),
+            _numeric_series(df, ["tyre_slip_ratio_rr", "SlipRatio_rr"]),
+        ]
+    )
+    rear_slip_angle = _mean_available(
+        [
+            _numeric_series(df, ["rear_slip_angle_mean"]),
+            _numeric_series(df, ["rear_slip_angle"]),
+            _numeric_series(df, ["SlipAngle_rl"]),
+            _numeric_series(df, ["SlipAngle_rr"]),
+        ]
+    )
+    tc_active = _binary_series(df, ["tc_active", "tc active", "tc in action"])
+    abs_active = _binary_series(df, ["abs_active", "abs active", "abs in action"])
 
     progress_series = None
     if "NormalizedSplinePosition" in df:
@@ -334,6 +423,15 @@ def canonicalize_dataframe(
                 "throttle": float(throttle.iloc[frame_index]),
                 "brake": float(brake.iloc[frame_index]),
                 "wheel_rotation": float(wheel_rotation),
+                "accel_x": float(accel_x.iloc[frame_index]) if np.isfinite(accel_x.iloc[frame_index]) else float("nan"),
+                "accel_y": float(accel_y.iloc[frame_index]) if np.isfinite(accel_y.iloc[frame_index]) else float("nan"),
+                "drive_train_speed": float(drive_train_speed.iloc[frame_index]) if np.isfinite(drive_train_speed.iloc[frame_index]) else float("nan"),
+                "rpm": float(rpm.iloc[frame_index]) if np.isfinite(rpm.iloc[frame_index]) else float("nan"),
+                "gear": float(gear.iloc[frame_index]) if np.isfinite(gear.iloc[frame_index]) else float("nan"),
+                "rear_slip_ratio_mean": float(rear_slip_ratio.iloc[frame_index]) if np.isfinite(rear_slip_ratio.iloc[frame_index]) else float("nan"),
+                "rear_slip_angle_mean": float(rear_slip_angle.iloc[frame_index]) if np.isfinite(rear_slip_angle.iloc[frame_index]) else float("nan"),
+                "tc_active": float(tc_active.iloc[frame_index]) if np.isfinite(tc_active.iloc[frame_index]) else float("nan"),
+                "abs_active": float(abs_active.iloc[frame_index]) if np.isfinite(abs_active.iloc[frame_index]) else float("nan"),
                 "lap_count": lap_count,
             }
         )
@@ -358,9 +456,16 @@ def build_demo_dataset(
     for episode in range(episodes):
         progress = float(rng.uniform(0.0, 1.0))
         state = model.initial_state(track, progress=progress, speed=float(rng.uniform(8.0, 14.0)))
+        previous_state = None
         for step in range(steps_per_episode):
             action = driver.act(state, track)
             projection = track.project(state.x, state.y)
+            telemetry = runtime_telemetry_proxy(
+                state,
+                previous_state=previous_state,
+                dt=scenario.simulation.dt,
+                vehicle_config=scenario.vehicle,
+            )
             rows.append(
                 {
                     "trajectory_id": f"demo_{episode:03d}",
@@ -383,6 +488,15 @@ def build_demo_dataset(
                     "throttle": action[1],
                     "brake": action[2],
                     "wheel_rotation": state.wheel_rotation,
+                    "accel_x": telemetry["accel_x"],
+                    "accel_y": telemetry["accel_y"],
+                    "drive_train_speed": telemetry["drive_train_speed"],
+                    "rpm": float(1000.0 + telemetry["rpm_norm"] * 8000.0),
+                    "gear": float(1.0 + round(telemetry["gear_norm"] * 6.0)),
+                    "rear_slip_ratio_mean": telemetry["rear_slip_ratio_mean"],
+                    "rear_slip_angle_mean": telemetry["rear_slip_angle_mean"],
+                    "tc_active": telemetry["tc_active"],
+                    "abs_active": telemetry["abs_active"],
                     "lap_count": state.lap_count,
                 }
             )
@@ -394,6 +508,7 @@ def build_demo_dataset(
             residual[0] = 0.1 * np.sin(episode + projection.progress * np.pi * 8.0) + rng.normal(0.0, 0.03)
             residual += rng.normal(0.0, [0.02, 0.03, 0.015], size=3)
 
+            previous_state = state
             state = model.step(state, action, track, scenario.simulation.dt, residual=residual)
             if track.out_of_bounds(state.lateral_error):
                 break
@@ -424,7 +539,7 @@ def build_canonical_dataset(
             track=track,
             track_id=resolved_track_id,
             car_id=resolved_car_id,
-            trajectory_id=path.stem,
+            trajectory_id=_trajectory_id_from_path(path),
         )
         frames.append(canonical)
         manifest.append(
@@ -433,6 +548,7 @@ def build_canonical_dataset(
                 "source_format": loaded.source_format,
                 "track_id": resolved_track_id,
                 "car_id": resolved_car_id,
+                "trajectory_id": canonical["trajectory_id"].iloc[0],
                 "rows": int(len(canonical)),
             }
         )

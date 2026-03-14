@@ -19,9 +19,10 @@ from uncertain_racecar_gym.dataset import CANONICAL_COLUMNS, build_demo_dataset
 from uncertain_racecar_gym.deterministic import load_calibration_model
 from uncertain_racecar_gym.dynamics import DynamicBicycleModel
 from uncertain_racecar_gym.env import UncertainRacecarEnv
+from uncertain_racecar_gym.features import FEATURE_NAMES, build_feature_vector_from_row, history_means_from_feature_vector, telemetry_from_canonical_row
 from uncertain_racecar_gym.scenario import Scenario, load_scenario
 from uncertain_racecar_gym.track import TrackModel
-from uncertain_racecar_gym.uncertainty import EmpiricalUncertaintyModel, FEATURE_NAMES, RESIDUAL_NAMES
+from uncertain_racecar_gym.uncertainty import EmpiricalUncertaintyModel, RESIDUAL_NAMES, regime_key_from_feature_vector
 
 
 @dataclass(slots=True)
@@ -46,36 +47,34 @@ def compute_residual_table(canonical: pd.DataFrame, scenario: Scenario) -> pd.Da
         for index in range(len(group) - 1):
             current = group.iloc[index]
             nxt = group.iloc[index + 1]
+            previous_row = group.iloc[index - 1] if index > 0 else None
             state = model.state_from_canonical_row(current)
             action = np.array([current["steer"], current["throttle"], current["brake"]], dtype=float)
             prediction = model.predict(state, action, float(current["dt"]))
             progress_bin = int(min(track.progress_bins - 1, max(0, np.floor(float(current["progress"]) * track.progress_bins))))
+            feature_vector = build_feature_vector_from_row(
+                current,
+                action_history=action_history,
+                vehicle_config=scenario.vehicle,
+                previous_row=previous_row,
+            )
+            history_steer_mean, history_throttle_mean, history_brake_mean = history_means_from_feature_vector(feature_vector)
+            telemetry = telemetry_from_canonical_row(
+                current,
+                previous_row=previous_row,
+                dt=float(current["dt"]),
+                vehicle_config=scenario.vehicle,
+            )
             rows.append(
                 {
                     **current.to_dict(),
                     "progress_bin": progress_bin,
                     "abs_curvature": abs(float(current["curvature"])),
-                    "history_steer_mean": float(np.mean([item[0] for item in action_history])),
-                    "history_throttle_mean": float(np.mean([item[1] for item in action_history])),
-                    "history_brake_mean": float(np.mean([item[2] for item in action_history])),
-                    "feature_vector": np.concatenate(
-                        [
-                            np.array(
-                                [
-                                    current["curvature"],
-                                    current["progress"],
-                                    current["vx"],
-                                    current["vy"],
-                                    current["yaw_rate"],
-                                    current["steer"],
-                                    current["throttle"],
-                                    current["brake"],
-                                ],
-                                dtype=float,
-                            ),
-                            np.asarray(action_history, dtype=float).reshape(-1),
-                        ]
-                    ),
+                    "history_steer_mean": history_steer_mean,
+                    "history_throttle_mean": history_throttle_mean,
+                    "history_brake_mean": history_brake_mean,
+                    **telemetry,
+                    "feature_vector": feature_vector,
                     "delta_vx": float(nxt["vx"]) - prediction.vx,
                     "delta_vy": float(nxt["vy"]) - prediction.vy,
                     "delta_yaw_rate": float(nxt["yaw_rate"]) - prediction.yaw_rate,
@@ -168,14 +167,108 @@ def _sample_model_distribution(
                     "frame_index": int(row.frame_index),
                     "abs_curvature": float(row.abs_curvature),
                     "vx": float(row.vx),
+                    "regime_key": regime_key_from_feature_vector(np.asarray(row.feature_vector, dtype=float)),
                     "sample_index": draw,
                     "delta_vx_sample": float(sample[0]),
                     "delta_vy_sample": float(sample[1]),
                     "delta_yaw_rate_sample": float(sample[2]),
                     "mode": info.get("mode", "unknown"),
+                    "candidate_scope": info.get("candidate_scope", "unknown"),
                 }
             )
     return pd.DataFrame(samples)
+
+
+def _attach_regime_keys(frame: pd.DataFrame) -> pd.DataFrame:
+    if "regime_key" in frame.columns:
+        return frame.copy()
+    attached = frame.copy()
+    attached["regime_key"] = [regime_key_from_feature_vector(np.asarray(vector, dtype=float)) for vector in attached["feature_vector"]]
+    return attached
+
+
+def _channel_active_from_metrics(
+    baseline_rmse: float,
+    model_rmse: float,
+    baseline_wasserstein: float,
+    model_wasserstein: float,
+) -> bool:
+    worse = (
+        model_rmse > baseline_rmse * 1.02
+        and model_wasserstein > baseline_wasserstein * 1.02
+    )
+    improved = (
+        model_rmse < baseline_rmse * 0.98
+        or model_wasserstein < baseline_wasserstein * 0.98
+    )
+    return (not worse) and improved
+
+
+def _compute_global_channel_mask(rmse_metrics: dict[str, dict[str, float]], wasserstein_metrics: dict[str, dict[str, float]]) -> np.ndarray:
+    return np.asarray(
+        [
+            _channel_active_from_metrics(
+                rmse_metrics["baseline_rmse"][channel],
+                rmse_metrics["model_rmse"][channel],
+                wasserstein_metrics["baseline_wasserstein"][channel],
+                wasserstein_metrics["model_wasserstein"][channel],
+            )
+            for channel in RESIDUAL_NAMES
+        ],
+        dtype=bool,
+    )
+
+
+def _same_regime_masks(lhs: dict[str, np.ndarray], rhs: dict[str, np.ndarray]) -> bool:
+    if set(lhs) != set(rhs):
+        return False
+    return all(np.array_equal(lhs[key], rhs[key]) for key in lhs)
+
+
+def _compute_regime_channel_masks(
+    evaluated: pd.DataFrame,
+    sampled: pd.DataFrame,
+    min_samples: int = 180,
+) -> tuple[dict[str, np.ndarray], pd.DataFrame]:
+    evaluated = _attach_regime_keys(evaluated)
+    sampled = sampled.copy()
+    rows = []
+    regime_masks: dict[str, np.ndarray] = {}
+    for regime_key, group in evaluated.groupby("regime_key", observed=True):
+        sample_group = sampled.loc[sampled["regime_key"] == regime_key].copy()
+        if len(group) < min_samples or len(sample_group) < min_samples:
+            continue
+        channel_mask = []
+        for channel in RESIDUAL_NAMES:
+            actual = group[channel].to_numpy(dtype=float)
+            predicted = group[f"{channel}_pred"].to_numpy(dtype=float)
+            sampled_values = sample_group[f"{channel}_sample"].to_numpy(dtype=float)
+            baseline_rmse = _rmse(actual, np.zeros(len(actual), dtype=float))
+            model_rmse = _rmse(actual, predicted)
+            baseline_wasserstein = float(wasserstein_distance(actual, np.zeros(len(actual), dtype=float)))
+            model_wasserstein = float(wasserstein_distance(actual, sampled_values))
+            active = _channel_active_from_metrics(
+                baseline_rmse,
+                model_rmse,
+                baseline_wasserstein,
+                model_wasserstein,
+            )
+            channel_mask.append(active)
+            rows.append(
+                {
+                    "regime_key": regime_key,
+                    "channel": channel,
+                    "count": int(len(group)),
+                    "baseline_rmse": baseline_rmse,
+                    "model_rmse": model_rmse,
+                    "baseline_wasserstein": baseline_wasserstein,
+                    "model_wasserstein": model_wasserstein,
+                    "wasserstein_improvement_percent": 100.0 * (baseline_wasserstein - model_wasserstein) / max(baseline_wasserstein, 1e-9),
+                    "active": bool(active),
+                }
+            )
+        regime_masks[regime_key] = np.asarray(channel_mask, dtype=bool)
+    return regime_masks, pd.DataFrame(rows)
 
 
 def _rmse(actual: np.ndarray, predicted: np.ndarray) -> float:
@@ -289,6 +382,49 @@ def _save_state_context_plots(canonical: pd.DataFrame, plot_dir: Path) -> Path:
         fig.colorbar(image, ax=axis, fraction=0.046, pad=0.04)
     fig.tight_layout()
     path = plot_dir / "state_context_plots.png"
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+    return path
+
+
+def _save_telemetry_context_plots(canonical: pd.DataFrame, plot_dir: Path) -> Path:
+    sample = canonical.sample(n=min(50000, len(canonical)), random_state=17) if len(canonical) > 50000 else canonical
+    fig, axes = plt.subplots(2, 2, figsize=(13, 9))
+    axes = axes.flatten()
+
+    speed_gap = sample["drive_train_speed"].to_numpy(dtype=float) - sample["vx"].to_numpy(dtype=float)
+    axes[0].hist(speed_gap[np.isfinite(speed_gap)], bins=50, color="#2563eb", alpha=0.85)
+    axes[0].set_title("Drive-train speed minus body vx")
+    axes[0].set_xlabel("speed gap [m/s]")
+    axes[0].set_ylabel("count")
+
+    rear_slip_ratio = sample["rear_slip_ratio_mean"].replace([np.inf, -np.inf], np.nan).dropna().to_numpy(dtype=float)
+    axes[1].hist(rear_slip_ratio, bins=50, color="#dc2626", alpha=0.8)
+    axes[1].set_title("Rear slip ratio")
+    axes[1].set_xlabel("slip ratio")
+    axes[1].set_ylabel("count")
+
+    image = axes[2].hexbin(
+        sample["rear_slip_angle_mean"],
+        sample["yaw_rate"],
+        C=sample["vx"],
+        reduce_C_function=np.mean,
+        gridsize=30,
+        cmap="viridis",
+        mincnt=1,
+    )
+    axes[2].set_title("Rear slip angle vs yaw rate")
+    axes[2].set_xlabel("rear slip angle [rad]")
+    axes[2].set_ylabel("yaw_rate [rad/s]")
+    fig.colorbar(image, ax=axes[2], fraction=0.046, pad=0.04, label="mean vx")
+
+    axes[3].hexbin(sample["rpm"], sample["accel_x"], gridsize=28, cmap="magma", mincnt=1)
+    axes[3].set_title("RPM vs longitudinal acceleration")
+    axes[3].set_xlabel("rpm")
+    axes[3].set_ylabel("accel_x [m/s^2]")
+
+    fig.tight_layout()
+    path = plot_dir / "telemetry_context_plots.png"
     fig.savefig(path, dpi=180)
     plt.close(fig)
     return path
@@ -553,6 +689,94 @@ def _save_wasserstein_by_curvature(evaluated: pd.DataFrame, sampled: pd.DataFram
     return path
 
 
+def _save_regime_activity_heatmap(regime_metrics: pd.DataFrame, plot_dir: Path) -> Path:
+    path = plot_dir / "regime_channel_activity.png"
+    fig, axis = plt.subplots(figsize=(10, 6))
+    if regime_metrics.empty:
+        axis.text(0.5, 0.5, "No regime-specific activity slices met the sample threshold.", ha="center", va="center")
+        axis.axis("off")
+        fig.tight_layout()
+        fig.savefig(path, dpi=180)
+        plt.close(fig)
+        return path
+
+    top_regimes = (
+        regime_metrics.groupby("regime_key", observed=True)["count"]
+        .max()
+        .sort_values(ascending=False)
+        .head(14)
+        .index.tolist()
+    )
+    frame = regime_metrics.loc[regime_metrics["regime_key"].isin(top_regimes)].copy()
+    frame["regime_key"] = pd.Categorical(frame["regime_key"], categories=top_regimes, ordered=True)
+    pivot = frame.pivot(index="regime_key", columns="channel", values="wasserstein_improvement_percent").fillna(0.0)
+    image = axis.imshow(pivot.to_numpy(), aspect="auto", cmap="coolwarm", vmin=-40.0, vmax=40.0)
+    axis.set_yticks(np.arange(len(pivot.index)))
+    axis.set_yticklabels(pivot.index.tolist(), fontsize=8)
+    axis.set_xticks(np.arange(len(pivot.columns)))
+    axis.set_xticklabels(pivot.columns.tolist())
+    axis.set_title("Regime-specific Wasserstein improvement (%)")
+    for row_index, regime_key in enumerate(pivot.index):
+        active_row = frame.loc[frame["regime_key"] == regime_key, ["channel", "active"]].drop_duplicates().set_index("channel")
+        for column_index, channel in enumerate(pivot.columns):
+            marker = "on" if bool(active_row.loc[channel, "active"]) else "off"
+            axis.text(column_index, row_index, marker, ha="center", va="center", fontsize=7, color="#111827")
+    fig.colorbar(image, ax=axis, fraction=0.046, pad=0.04, label="improvement %")
+    fig.tight_layout()
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+    return path
+
+
+def _save_longitudinal_regime_examples(evaluated: pd.DataFrame, sampled: pd.DataFrame, regime_metrics: pd.DataFrame, plot_dir: Path) -> Path:
+    path = plot_dir / "longitudinal_regime_examples.png"
+    fig, axes = plt.subplots(3, 2, figsize=(16, 12))
+    axes = axes.flatten()
+    if regime_metrics.empty:
+        for axis in axes:
+            axis.text(0.5, 0.5, "No longitudinal regime examples available.", ha="center", va="center")
+            axis.axis("off")
+        fig.tight_layout()
+        fig.savefig(path, dpi=180)
+        plt.close(fig)
+        return path
+
+    regime_metrics = regime_metrics.copy()
+    regime_metrics = regime_metrics.loc[regime_metrics["channel"] == "delta_vx"].copy()
+    regime_metrics = regime_metrics.sort_values(
+        by=["active", "wasserstein_improvement_percent", "count"],
+        ascending=[False, False, False],
+    )
+    chosen = regime_metrics.head(6)["regime_key"].tolist()
+    evaluated = _attach_regime_keys(evaluated)
+    for axis, regime_key in zip(axes, chosen):
+        actual = evaluated.loc[evaluated["regime_key"] == regime_key, "delta_vx"].to_numpy(dtype=float)
+        sampled_values = sampled.loc[sampled["regime_key"] == regime_key, "delta_vx_sample"].to_numpy(dtype=float)
+        if len(actual) == 0 or len(sampled_values) == 0:
+            axis.axis("off")
+            continue
+        low = min(float(actual.min()), float(sampled_values.min()), 0.0)
+        high = max(float(actual.max()), float(sampled_values.max()), 0.0)
+        bins = np.linspace(low, high, 40)
+        axis.hist(actual, bins=bins, density=True, alpha=0.35, color="#111827", label="actual")
+        axis.hist(sampled_values, bins=bins, density=True, histtype="step", linewidth=2.0, color="#2563eb", label="sampled")
+        metrics_row = regime_metrics.loc[regime_metrics["regime_key"] == regime_key].iloc[0]
+        axis.set_title(
+            f"{regime_key}\nactive={bool(metrics_row['active'])}, n={int(metrics_row['count'])}, "
+            f"W%={metrics_row['wasserstein_improvement_percent']:.1f}",
+            fontsize=9,
+        )
+        axis.set_xlabel("delta_vx")
+        axis.set_ylabel("density")
+        axis.legend(fontsize=8)
+    for axis in axes[len(chosen) :]:
+        axis.axis("off")
+    fig.tight_layout()
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+    return path
+
+
 def _simulate_rollout_series(
     scenario: Scenario,
     artifact_path: Path | None,
@@ -575,6 +799,7 @@ def _simulate_rollout_series(
         uncertainty=mode,
         uncertainty_artifact=artifact_path if mode == "empirical" else None,
         calibration_artifact=calibration_artifact_path,
+        apply_mean_correction=calibration_artifact_path is not None,
         renderer=None,
     )
     env.reset(seed=7, options={"uncertainty_mode": mode, "start_mode": "random"})
@@ -834,24 +1059,55 @@ def generate_uncertainty_report(
     sampled = _sample_model_distribution(test_residuals, artifact, sample_count=4, seed=17)
     rmse_metrics = _compute_rmse_metrics(evaluated)
     wasserstein_metrics = _compute_wasserstein_metrics(evaluated, sampled)
-    disabled_stochastic_channels = [
-        channel
-        for channel in RESIDUAL_NAMES
-        if rmse_metrics["model_rmse"][channel] > rmse_metrics["baseline_rmse"][channel] * 1.02
-        and wasserstein_metrics["model_wasserstein"][channel] > wasserstein_metrics["baseline_wasserstein"][channel] * 1.02
-    ]
-    if disabled_stochastic_channels:
-        artifact = artifact.copy().zero_residual_channels(disabled_stochastic_channels)
+    global_channel_mask = _compute_global_channel_mask(rmse_metrics, wasserstein_metrics)
+    regime_channel_masks, regime_metrics = _compute_regime_channel_masks(evaluated, sampled)
+    for _ in range(2):
+        if np.all(global_channel_mask) and not regime_channel_masks:
+            break
+        artifact = artifact.copy().with_channel_masks(
+            global_channel_mask=global_channel_mask,
+            regime_channel_masks=regime_channel_masks,
+        )
         evaluated = _evaluate_model(test_residuals, artifact, scenario)
         sampled = _sample_model_distribution(test_residuals, artifact, sample_count=4, seed=17)
         rmse_metrics = _compute_rmse_metrics(evaluated)
         wasserstein_metrics = _compute_wasserstein_metrics(evaluated, sampled)
+        next_global_channel_mask = _compute_global_channel_mask(rmse_metrics, wasserstein_metrics)
+        next_regime_channel_masks, regime_metrics = _compute_regime_channel_masks(evaluated, sampled)
+        if np.array_equal(next_global_channel_mask, global_channel_mask) and _same_regime_masks(next_regime_channel_masks, regime_channel_masks):
+            global_channel_mask = next_global_channel_mask
+            regime_channel_masks = next_regime_channel_masks
+            break
+        global_channel_mask = next_global_channel_mask
+        regime_channel_masks = next_regime_channel_masks
+    artifact = artifact.copy().with_channel_masks(
+        global_channel_mask=global_channel_mask,
+        regime_channel_masks=regime_channel_masks,
+    )
+    evaluated = _evaluate_model(test_residuals, artifact, scenario)
+    sampled = _sample_model_distribution(test_residuals, artifact, sample_count=4, seed=17)
+    rmse_metrics = _compute_rmse_metrics(evaluated)
+    wasserstein_metrics = _compute_wasserstein_metrics(evaluated, sampled)
+    regime_channel_masks, regime_metrics = _compute_regime_channel_masks(evaluated, sampled)
+    regime_active_any = np.asarray(
+        [
+            any(mask[index] for mask in regime_channel_masks.values())
+            for index, _channel in enumerate(RESIDUAL_NAMES)
+        ],
+        dtype=bool,
+    )
+    disabled_stochastic_channels = [
+        channel
+        for index, channel in enumerate(RESIDUAL_NAMES)
+        if not global_channel_mask[index] and not regime_active_any[index]
+    ]
     artifact.save(artifact_path)
 
     plot_dir.mkdir(parents=True, exist_ok=True)
     track_overview_path = _save_track_overview(canonical, plot_dir)
     control_distributions_path = _save_control_distributions(canonical, plot_dir)
     state_context_path = _save_state_context_plots(canonical, plot_dir)
+    telemetry_context_path = _save_telemetry_context_plots(canonical, plot_dir)
     hist_path = _save_residual_histograms(evaluated, plot_dir)
     grouped_hist_path = _save_curvature_group_histograms(evaluated, plot_dir)
     heatmap_path = _save_heatmaps(evaluated, plot_dir)
@@ -862,6 +1118,8 @@ def generate_uncertainty_report(
     prediction_scatter_path = _save_prediction_scatter(evaluated, plot_dir)
     wasserstein_path, wasserstein_metrics = _save_wasserstein_bars(evaluated, sampled, plot_dir)
     curvature_wasserstein_path = _save_wasserstein_by_curvature(evaluated, sampled, plot_dir)
+    regime_activity_path = _save_regime_activity_heatmap(regime_metrics, plot_dir)
+    longitudinal_regime_path = _save_longitudinal_regime_examples(evaluated, sampled, regime_metrics, plot_dir)
     rollout_overlay_path = _save_rollout_overlay(
         scenario,
         artifact_path,
@@ -906,8 +1164,14 @@ def generate_uncertainty_report(
         "rmse_improvement_percent": improvement,
         "baseline_wasserstein": wasserstein_metrics["baseline_wasserstein"],
         "model_wasserstein": wasserstein_metrics["model_wasserstein"],
+        "global_channel_mask": {channel: bool(global_channel_mask[index]) for index, channel in enumerate(RESIDUAL_NAMES)},
+        "active_regime_count_by_channel": {
+            channel: int(sum(bool(mask[index]) for mask in regime_channel_masks.values()))
+            for index, channel in enumerate(RESIDUAL_NAMES)
+        },
         "mean_abs_curvature": float(evaluated["abs_curvature"].mean()),
         "mean_speed": float(evaluated["vx"].mean()),
+        "regime_metrics": json.loads(regime_metrics.to_json(orient="records")) if not regime_metrics.empty else [],
         "multimodal_examples": [
             {
                 "channel": example["channel"],
@@ -928,6 +1192,7 @@ def generate_uncertainty_report(
     track_overview_ref = _relative_markdown_path(track_overview_path, report_path)
     control_distributions_ref = _relative_markdown_path(control_distributions_path, report_path)
     state_context_ref = _relative_markdown_path(state_context_path, report_path)
+    telemetry_context_ref = _relative_markdown_path(telemetry_context_path, report_path)
     grouped_hist_ref = _relative_markdown_path(grouped_hist_path, report_path)
     heatmap_ref = _relative_markdown_path(heatmap_path, report_path)
     relationship_ref = _relative_markdown_path(relationship_path, report_path)
@@ -939,6 +1204,8 @@ def generate_uncertainty_report(
     curvature_wasserstein_ref = _relative_markdown_path(curvature_wasserstein_path, report_path)
     rollout_overlay_ref = _relative_markdown_path(rollout_overlay_path, report_path)
     rollout_channel_ref = _relative_markdown_path(rollout_channel_path, report_path)
+    regime_activity_ref = _relative_markdown_path(regime_activity_path, report_path)
+    longitudinal_regime_ref = _relative_markdown_path(longitudinal_regime_path, report_path)
     multimodal_ref = _relative_markdown_path(multimodal_path, report_path)
     multimodal_lines = []
     for example in multimodal_examples:
@@ -967,7 +1234,9 @@ def generate_uncertainty_report(
                     if calibration_artifact_path is not None
                     else []
                 ),
-                f"- Disabled stochastic channels after hold-out check: `{disabled_stochastic_channels if disabled_stochastic_channels else 'none'}`",
+                f"- Globally disabled stochastic channels after hold-out check: `{disabled_stochastic_channels if disabled_stochastic_channels else 'none'}`",
+                f"- Default global channel mask: `{metrics['global_channel_mask']}`",
+                f"- Active regime count by channel: `{metrics['active_regime_count_by_channel']}`",
                 "",
                 "## 2. What the current renderer is",
                 "",
@@ -1020,6 +1289,7 @@ def generate_uncertainty_report(
                 "  - current pose/state: `x`, `y`, `yaw`, `vx`, `vy`, `yaw_rate`",
                 "  - track-relative state: `progress`, `lateral_error`, `heading_error`, `curvature`",
                 "  - controls: `steer`, `throttle`, `brake`",
+                "  - extra telemetry: `accel_x`, `accel_y`, `drive_train_speed`, `rpm`, `gear`, `rear_slip_ratio_mean`, `rear_slip_angle_mean`, `tc_active`, `abs_active`",
                 "  - metadata: `trajectory_id`, `track_id`, `car_id`, `frame_index`, `dt`",
                 "- This schema is the bridge between synthetic data, Assetto-like logs, and future data sources.",
                 "",
@@ -1031,9 +1301,11 @@ def generate_uncertainty_report(
                 "   - `delta_vx = vx[t+1] - vx_nominal[t+1]`",
                 "   - `delta_vy = vy[t+1] - vy_nominal[t+1]`",
                 "   - `delta_yaw_rate = yaw_rate[t+1] - yaw_rate_nominal[t+1]`",
-                "4. Build a conditional feature vector from the current local driving context.",
+                "4. Build a conditional feature vector from the current local driving context and the richer telemetry channels.",
                 "5. Gate by `(track_id, car_id, progress_bin)` and search neighbors within each gate.",
-                "6. At rollout time, sample a residual from nearby contexts and add it to the nominal prediction.",
+                "6. Narrow the candidate set further with a runtime regime key built from speed, control, slip, and cornering context.",
+                "7. Apply a global plus regime-specific channel mask so weak channels can stay disabled except where the data supports them.",
+                "8. At rollout time, sample a residual from nearby contexts and add it to the nominal prediction.",
                 "",
                 "## 6. Continuous uncertainty model: input and output",
                 "",
@@ -1041,7 +1313,9 @@ def generate_uncertainty_report(
                 f"- History length: `{artifact.history_length}`",
                 f"- Full feature dimension: `{metrics['feature_dimension']}`",
                 "- Full model input:",
-                "  - `[curvature, progress, vx, vy, yaw_rate, steer, throttle, brake, 5-step action history]`",
+                "  - core state/control: `[curvature, progress, vx, vy, yaw_rate, steer, throttle, brake]`",
+                "  - telemetry context: `[accel_x, accel_y, drive_train_speed, speed_gap, rear_slip_ratio_mean, rear_slip_angle_mean, gear_norm, rpm_norm, tc_active, abs_active]`",
+                "  - short memory: `[5-step action history]`",
                 "- Model output:",
                 "  - `[delta_vx, delta_vy, delta_yaw_rate]`",
                 "- So this is a **continuous conditional residual model**:",
@@ -1067,6 +1341,7 @@ def generate_uncertainty_report(
                 "- The pose update uses the corrected dynamic state.",
                 "- That means the uncertainty is conditioned on the **current state and action**, not injected as a state-independent white-noise term.",
                 "- The runtime sampler also supports short block continuation so uncertainty can remain temporally correlated across several steps.",
+                "- It also keeps regime-conditioned channel masks, so a channel like `delta_vx` can be active only in the parts of the operating envelope where it is supported by held-out data.",
                 "",
                 "## 8. Bucket structure used by the current model",
                 "",
@@ -1078,6 +1353,9 @@ def generate_uncertainty_report(
                 "  - `car_id`",
                 "  - `progress_bin`",
                 "- Inside a gate, the model uses normalized feature-space kNN to retrieve local residual examples.",
+                "- The local query is then optionally narrowed by a regime key of the form:",
+                "  - `control_mode | speed_band | corner_mode | turn_direction`",
+                "- This reduces mixing between brake / coast / power phases that were previously being blended inside the same progress slice.",
                 "",
                 "## 9. Dataset characterization plots",
                 "",
@@ -1092,6 +1370,10 @@ def generate_uncertainty_report(
                 f"![State Context Plots]({state_context_ref})",
                 "",
                 "- These plots show the state-action operating envelope before fitting the residual model.",
+                "",
+                f"![Telemetry Context Plots]({telemetry_context_ref})",
+                "",
+                "- These plots expose the richer Assetto telemetry now carried into the model, especially longitudinal acceleration, drive-train speed mismatch, RPM, and rear slip context.",
                 "",
                 "## 10. Residual and uncertainty plots",
                 "",
@@ -1147,6 +1429,16 @@ def generate_uncertainty_report(
                 f"![Wasserstein by Curvature]({curvature_wasserstein_ref})",
                 "",
                 "- This checks whether the sampled uncertainty model stays closer to the true held-out distribution across different curvature bins.",
+                "",
+                f"![Regime Channel Activity]({regime_activity_ref})",
+                "",
+                "- This heatmap shows where each stochastic channel is actually supported by held-out data.",
+                "- The text overlay in each cell marks whether that channel stays active in that regime after the hold-out check.",
+                "",
+                f"![Longitudinal Regime Examples]({longitudinal_regime_ref})",
+                "",
+                "- These are the most informative `delta_vx` regime slices after the new regime-aware masking pass.",
+                "- This is the main diagnostic for whether the longitudinal stochastic channel is useful only in a subset of the envelope or broadly across the lap.",
                 "",
                 f"![Rollout Overlay]({rollout_overlay_ref})",
                 "",
