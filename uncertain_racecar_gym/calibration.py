@@ -140,16 +140,28 @@ def _save_longitudinal_focus(
     stable_centered_mask = longitudinal_training_mask(longitudinal_test, scenario, min_vx=min_vx, max_abs_delta_vx=max_abs_delta_vx).to_numpy(dtype=bool)
     stable_raw = raw_test.loc[stable_raw_mask].copy()
     stable_centered = longitudinal_test.loc[stable_centered_mask].copy()
+    focus_raw = stable_raw if not stable_raw.empty else raw_test.copy()
+    focus_centered = stable_centered if not stable_centered.empty else longitudinal_test.copy()
+    histogram_title = (
+        "Stable driving delta_vx before/after longitudinal correction"
+        if not stable_raw.empty and not stable_centered.empty
+        else "delta_vx before/after longitudinal correction (fallback to all hold-out rows)"
+    )
+    progress_title = (
+        "Stable driving delta_vx mean over progress"
+        if not stable_raw.empty and not stable_centered.empty
+        else "delta_vx mean over progress (fallback to all hold-out rows)"
+    )
 
-    stable_raw["progress_bin"] = pd.cut(stable_raw["progress"], bins=40, include_lowest=True)
-    stable_centered["progress_bin"] = pd.cut(stable_centered["progress"], bins=40, include_lowest=True)
-    raw_group = stable_raw.groupby("progress_bin", observed=False)["delta_vx"].mean().reset_index(drop=True)
-    centered_group = stable_centered.groupby("progress_bin", observed=False)["delta_vx"].mean().reset_index(drop=True)
+    focus_raw["progress_bin"] = pd.cut(focus_raw["progress"], bins=40, include_lowest=True)
+    focus_centered["progress_bin"] = pd.cut(focus_centered["progress"], bins=40, include_lowest=True)
+    raw_group = focus_raw.groupby("progress_bin", observed=False)["delta_vx"].mean().reset_index(drop=True)
+    centered_group = focus_centered.groupby("progress_bin", observed=False)["delta_vx"].mean().reset_index(drop=True)
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 4.5))
-    axes[0].hist(stable_raw["delta_vx"], bins=60, color="#94a3b8", alpha=0.82, label="raw")
-    axes[0].hist(stable_centered["delta_vx"], bins=60, color="#2563eb", alpha=0.65, label="after parametric vx correction")
-    axes[0].set_title("Stable driving delta_vx before/after longitudinal correction")
+    axes[0].hist(focus_raw["delta_vx"], bins=60, color="#94a3b8", alpha=0.82, label="raw")
+    axes[0].hist(focus_centered["delta_vx"], bins=60, color="#2563eb", alpha=0.65, label="after parametric vx correction")
+    axes[0].set_title(histogram_title)
     axes[0].set_xlabel("delta_vx")
     axes[0].set_ylabel("count")
     axes[0].legend()
@@ -157,7 +169,7 @@ def _save_longitudinal_focus(
     axes[1].plot(raw_group.index, raw_group.to_numpy(dtype=float), color="#94a3b8", label="raw mean")
     axes[1].plot(centered_group.index, centered_group.to_numpy(dtype=float), color="#2563eb", label="corrected mean")
     axes[1].axhline(0.0, color="#111827", linewidth=0.8, alpha=0.4)
-    axes[1].set_title("Stable driving delta_vx mean over progress")
+    axes[1].set_title(progress_title)
     axes[1].set_xlabel("progress bin")
     axes[1].set_ylabel("mean delta_vx")
     axes[1].legend()

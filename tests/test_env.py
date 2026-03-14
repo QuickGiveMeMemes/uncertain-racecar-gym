@@ -11,7 +11,7 @@ from uncertain_racecar_gym.dataset import build_demo_dataset
 from uncertain_racecar_gym.analysis import compute_residual_table
 from uncertain_racecar_gym.deterministic import HybridCalibrationModel, fit_longitudinal_correction, load_calibration_model
 from uncertain_racecar_gym.scenario import load_scenario
-from uncertain_racecar_gym.uncertainty import EmpiricalUncertaintyModel
+from uncertain_racecar_gym.uncertainty import EmpiricalUncertaintyModel, regime_key_from_feature_vector
 
 
 def test_env_smoke_nominal() -> None:
@@ -19,6 +19,7 @@ def test_env_smoke_nominal() -> None:
     obs, info = env.reset(seed=1)
     assert obs.shape[0] == env.observation_space.shape[0]
     assert "render_state" in info
+    assert info["uncertainty"]["mode"] == "none"
     for _ in range(8):
         obs, reward, terminated, truncated, info = env.step(np.array([0.0, 0.3, 0.0], dtype=np.float32))
         assert np.isfinite(reward)
@@ -58,6 +59,35 @@ def test_env_empirical_mode_changes_trajectory(tmp_path: Path) -> None:
     nominal.close()
     empirical.close()
     assert nominal_positions != empirical_positions
+
+
+def test_env_gaussian_mode_changes_trajectory_and_can_switch_runtime() -> None:
+    nominal = gym.make("UncertainRacecar-v0", renderer=None)
+    gaussian = gym.make(
+        "UncertainRacecar-v0",
+        renderer=None,
+        uncertainty="gaussian",
+        gaussian_noise_std=[0.25, 0.15, 0.08, 0.03],
+    )
+    nominal.reset(seed=7)
+    gaussian.reset(seed=7, options={"uncertainty_mode": "gaussian"})
+
+    action = np.array([0.05, 0.35, 0.0], dtype=np.float32)
+    nominal_positions = []
+    gaussian_positions = []
+    for _ in range(12):
+        _, _, done_n, trunc_n, info_n = nominal.step(action)
+        _, _, done_g, trunc_g, info_g = gaussian.step(action)
+        nominal_positions.append((info_n["state"]["x"], info_n["state"]["y"]))
+        gaussian_positions.append((info_g["state"]["x"], info_g["state"]["y"]))
+        if done_n or trunc_n or done_g or trunc_g:
+            break
+
+    assert nominal_positions != gaussian_positions
+    gaussian.unwrapped.set_uncertainty(None)
+    assert gaussian.unwrapped.uncertainty_mode is None
+    nominal.close()
+    gaussian.close()
 
 
 def test_fit_from_residual_table_and_gate_resolution(tmp_path: Path) -> None:
@@ -122,3 +152,46 @@ def test_sampler_persists_mode_key_across_samples(tmp_path: Path) -> None:
     assert runtime_state.active_mode_key is not None
     assert info0["mode_key"] == runtime_state.active_mode_key
     assert info1["mode_key"] == runtime_state.active_mode_key
+
+
+def test_regime_specific_channel_mask_can_enable_delta_vx_locally(tmp_path: Path) -> None:
+    scenario = load_scenario()
+    dataset_path = build_demo_dataset(scenario, tmp_path / "demo.parquet", episodes=6, steps_per_episode=50, seed=21)
+    canonical = pd.read_parquet(dataset_path)
+    residual_table = compute_residual_table(canonical, scenario)
+    artifact = EmpiricalUncertaintyModel.fit_from_residual_table(residual_table, scenario)
+
+    chosen_row = None
+    chosen_mean = None
+    chosen_gate = None
+    for row in residual_table.itertuples(index=False):
+        gate_key = artifact.resolve_gate_key(progress_bin=int(row.progress_bin), track_id=str(row.track_id), car_id=str(row.car_id))
+        predicted_mean, _ = artifact.predict_mean(np.asarray(row.feature_vector, dtype=float), gate_key)
+        if abs(float(predicted_mean[0])) > 1e-4:
+            chosen_row = row
+            chosen_mean = predicted_mean
+            chosen_gate = gate_key
+            break
+
+    assert chosen_row is not None
+    chosen_feature = np.asarray(chosen_row.feature_vector, dtype=float)
+    chosen_regime = regime_key_from_feature_vector(chosen_feature)
+    masked = artifact.copy().with_channel_masks(
+        global_channel_mask=np.array([False, True, True], dtype=bool),
+        regime_channel_masks={chosen_regime: np.array([True, True, True], dtype=bool)},
+    )
+
+    local_mean, _ = masked.predict_mean(chosen_feature, chosen_gate)
+    assert abs(float(local_mean[0])) > 1e-4
+
+    alternate_feature = chosen_feature.copy()
+    alternate_feature[6] = 0.0
+    alternate_feature[7] = 0.9
+    if regime_key_from_feature_vector(alternate_feature) == chosen_regime:
+        alternate_feature[7] = 0.0
+        alternate_feature[6] = 0.95
+
+    alternate_mean, info = masked.predict_mean(alternate_feature, chosen_gate)
+    assert regime_key_from_feature_vector(alternate_feature) != chosen_regime
+    assert alternate_mean[0] == 0.0
+    assert info["channel_mask"][0] == 0

@@ -34,6 +34,7 @@ uncertain-racecar-record-rollout = "uncertain_racecar_gym.cli:record_rollout_mai
 uncertain-racecar-compare-rollouts = "uncertain_racecar_gym.cli:compare_rollouts_main"
 uncertain-racecar-export-replay = "uncertain_racecar_gym.cli:export_replay_main"
 uncertain-racecar-analyze-uncertainty = "uncertain_racecar_gym.cli:analyze_uncertainty_main"
+uncertain-racecar-replay-evaluate = "uncertain_racecar_gym.cli:replay_evaluate_main"
 
 [tool.setuptools.packages.find]
 include = ["uncertain_racecar_gym*"]

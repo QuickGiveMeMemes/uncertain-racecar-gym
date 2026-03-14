@@ -9,6 +9,7 @@ import pandas as pd
 import pytest
 
 from uncertain_racecar_gym.dataset import CANONICAL_COLUMNS, build_canonical_dataset, build_demo_dataset, canonicalize_dataframe, load_records
+from uncertain_racecar_gym.features import TELEMETRY_CANONICAL_COLUMNS
 from uncertain_racecar_gym.scenario import load_scenario
 from uncertain_racecar_gym.track import TrackModel
 from uncertain_racecar_gym.track_builder import build_track_from_dataset
@@ -46,6 +47,44 @@ def test_canonicalize_assetto_like_dataframe() -> None:
     assert canonical["track_id"].iloc[0] == "demo_track"
     assert canonical["car_id"].iloc[0] == "demo_car"
     assert canonical["steer"].between(-1.0, 1.0).all()
+
+
+def test_canonicalize_preserves_richer_assetto_telemetry() -> None:
+    scenario = load_scenario()
+    track = TrackModel.from_config(scenario.track)
+    raw = pd.DataFrame(
+        {
+            "currentTime": [0.0, 0.05, 0.1],
+            "world_position_x": [10.0, 10.2, 10.4],
+            "world_position_y": [0.0, 0.1, 0.2],
+            "yaw": [0.0, 0.02, 0.03],
+            "local_velocity_x": [20.0, 20.5, 21.0],
+            "local_velocity_y": [0.1, 0.0, -0.1],
+            "angular_velocity_y": [0.01, 0.02, 0.03],
+            "steerAngle": [0.0, 20.0, 25.0],
+            "accStatus": [0.4, 0.5, 0.6],
+            "brakeStatus": [0.0, 0.0, 0.1],
+            "accelX": [0.2, 0.1, -0.3],
+            "accelY": [0.4, 0.5, 0.6],
+            "drive train speed": [72.0, 73.8, 75.6],
+            "RPM": [5000, 5200, 5400],
+            "actualGear": [4, 4, 4],
+            "tyre_slip_ratio_rl": [0.05, 0.08, 0.1],
+            "tyre_slip_ratio_rr": [0.03, 0.04, 0.06],
+            "SlipAngle_rl": [0.02, 0.03, 0.05],
+            "SlipAngle_rr": [0.01, 0.04, 0.03],
+            "tc active": [0, 1, 1],
+            "abs active": [0, 0, 1],
+        }
+    )
+    canonical = canonicalize_dataframe(raw, track, track_id="demo_track", car_id="demo_car", trajectory_id="traj")
+    for column in TELEMETRY_CANONICAL_COLUMNS:
+        assert column in canonical.columns
+    assert canonical["drive_train_speed"].iloc[0] == pytest.approx(20.0, abs=1e-6)
+    assert canonical["rear_slip_ratio_mean"].iloc[1] == pytest.approx(0.06, abs=1e-6)
+    assert canonical["rear_slip_angle_mean"].iloc[2] == pytest.approx(0.04, abs=1e-6)
+    assert canonical["tc_active"].iloc[1] == pytest.approx(1.0)
+    assert canonical["abs_active"].iloc[2] == pytest.approx(1.0)
 
 
 def test_canonicalize_prefers_lap_time_and_unwraps_resets() -> None:
@@ -216,6 +255,7 @@ def test_build_canonical_dataset_from_assetto_telemetry_pickle(tmp_path: Path) -
     assert canonical["car_id"].iloc[0] == "dallara_f317"
     assert canonical["dt"].iloc[1] == 0.05
     assert manifest[0]["source_format"] == "assetto_telemetry_pickle"
+    assert manifest[0]["trajectory_id"].endswith("__telemetry_sample")
 
 
 def test_canonicalize_uses_normalized_spline_progress() -> None:
@@ -262,6 +302,58 @@ def test_canonicalize_uses_sample_rate_when_current_time_is_tiny() -> None:
     )
     canonical = canonicalize_dataframe(raw, track, track_id="demo_track", car_id="demo_car", trajectory_id="traj")
     assert canonical["dt"].iloc[1] == pytest.approx(0.02, abs=1e-9)
+
+
+def test_build_canonical_dataset_uses_unique_trajectory_ids_for_duplicate_lap_stems(tmp_path: Path) -> None:
+    scenario = load_scenario()
+    inputs = []
+    for session_name in ("20240304_AB", "20240405_NH"):
+        path = tmp_path / "data_sets" / "ks_barcelona-layout_gp" / "dallara_f317" / session_name / "laps" / "lap.pkl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        raw = {
+            "states": [
+                {
+                    "lap time": 0.0,
+                    "world_position_x": 10.0,
+                    "world_position_y": 0.0,
+                    "yaw": 0.0,
+                    "local_velocity_x": 8.0,
+                    "local_velocity_y": 0.1,
+                    "angular_velocity_y": 0.01,
+                    "steerAngle": 0.0,
+                    "accStatus": 0.4,
+                    "brakeStatus": 0.0,
+                },
+                {
+                    "lap time": 0.05,
+                    "world_position_x": 10.2,
+                    "world_position_y": 0.1,
+                    "yaw": 0.01,
+                    "local_velocity_x": 8.2,
+                    "local_velocity_y": 0.0,
+                    "angular_velocity_y": 0.02,
+                    "steerAngle": 10.0,
+                    "accStatus": 0.5,
+                    "brakeStatus": 0.0,
+                },
+            ],
+            "static_info": "",
+        }
+        with path.open("wb") as handle:
+            pickle.dump(raw, handle, protocol=pickle.HIGHEST_PROTOCOL)
+        inputs.append(path)
+
+    output_path = tmp_path / "canonical.parquet"
+    build_canonical_dataset(
+        inputs=inputs,
+        output_path=output_path,
+        scenario=scenario,
+        track_id=None,
+        car_id=None,
+    )
+    canonical = pd.read_parquet(output_path)
+    trajectory_ids = sorted(canonical["trajectory_id"].unique().tolist())
+    assert trajectory_ids == ["20240304_AB__lap", "20240405_NH__lap"]
 
 
 def test_build_track_from_progress_dataset(tmp_path: Path) -> None:

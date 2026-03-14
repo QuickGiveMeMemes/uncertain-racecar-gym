@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 
 from uncertain_racecar_gym.scenario import Scenario
+from uncertain_racecar_gym.features import feature_value, history_means_from_feature_vector
 from uncertain_racecar_gym.uncertainty import EmpiricalUncertaintyModel, RESIDUAL_NAMES
 
 
@@ -24,11 +25,26 @@ LONGITUDINAL_FEATURE_NAMES = [
     "abs_curvature",
     "abs_vy",
     "abs_yaw_rate",
+    "accel_x",
+    "drive_train_speed",
+    "speed_gap",
+    "rear_slip_ratio_mean",
+    "rear_slip_angle_mean",
+    "gear_norm",
+    "rpm_norm",
+    "tc_active",
+    "abs_active",
     "throttle_vx",
     "brake_vx",
     "steer_vx",
     "throttle_abs_curvature",
     "brake_abs_curvature",
+    "speed_gap_vx",
+    "rear_slip_ratio_vx",
+    "throttle_slip_ratio",
+    "brake_slip_ratio",
+    "rpm_throttle",
+    "drive_speed_minus_vx",
     "sin_progress_1",
     "cos_progress_1",
     "sin_progress_2",
@@ -39,16 +55,25 @@ LONGITUDINAL_FEATURE_NAMES = [
 ]
 
 
-def _history_means(feature_vector: np.ndarray) -> tuple[float, float, float]:
-    if len(feature_vector) <= 8:
-        return 0.0, 0.0, 0.0
-    history = np.asarray(feature_vector[8:], dtype=float).reshape(-1, 3)
-    return float(history[:, 0].mean()), float(history[:, 1].mean()), float(history[:, 2].mean())
-
-
 def build_longitudinal_design_vector(feature_vector: np.ndarray) -> np.ndarray:
-    curvature, progress, vx, vy, yaw_rate, steer, throttle, brake = np.asarray(feature_vector[:8], dtype=float)
-    history_steer_mean, history_throttle_mean, history_brake_mean = _history_means(feature_vector)
+    curvature = feature_value(feature_vector, "curvature")
+    progress = feature_value(feature_vector, "progress")
+    vx = feature_value(feature_vector, "vx")
+    vy = feature_value(feature_vector, "vy")
+    yaw_rate = feature_value(feature_vector, "yaw_rate")
+    steer = feature_value(feature_vector, "steer")
+    throttle = feature_value(feature_vector, "throttle")
+    brake = feature_value(feature_vector, "brake")
+    accel_x = feature_value(feature_vector, "accel_x")
+    drive_train_speed = feature_value(feature_vector, "drive_train_speed", default=vx)
+    speed_gap = feature_value(feature_vector, "speed_gap")
+    rear_slip_ratio_mean = feature_value(feature_vector, "rear_slip_ratio_mean")
+    rear_slip_angle_mean = feature_value(feature_vector, "rear_slip_angle_mean")
+    gear_norm = feature_value(feature_vector, "gear_norm")
+    rpm_norm = feature_value(feature_vector, "rpm_norm")
+    tc_active = feature_value(feature_vector, "tc_active")
+    abs_active = feature_value(feature_vector, "abs_active")
+    history_steer_mean, history_throttle_mean, history_brake_mean = history_means_from_feature_vector(feature_vector)
     return np.array(
         [
             1.0,
@@ -62,11 +87,26 @@ def build_longitudinal_design_vector(feature_vector: np.ndarray) -> np.ndarray:
             abs(curvature),
             abs(vy),
             abs(yaw_rate),
+            accel_x,
+            drive_train_speed,
+            speed_gap,
+            rear_slip_ratio_mean,
+            rear_slip_angle_mean,
+            gear_norm,
+            rpm_norm,
+            tc_active,
+            abs_active,
             throttle * vx,
             brake * vx,
             abs(steer) * vx,
             throttle * abs(curvature),
             brake * abs(curvature),
+            speed_gap * vx,
+            rear_slip_ratio_mean * vx,
+            throttle * rear_slip_ratio_mean,
+            brake * rear_slip_ratio_mean,
+            rpm_norm * throttle,
+            drive_train_speed - vx,
             np.sin(2.0 * np.pi * progress),
             np.cos(2.0 * np.pi * progress),
             np.sin(4.0 * np.pi * progress),
@@ -101,7 +141,10 @@ class LongitudinalCorrectionModel:
     active: bool = True
 
     def eligible(self, feature_vector: np.ndarray) -> bool:
-        _, _, vx, vy, yaw_rate, steer, _, _ = np.asarray(feature_vector[:8], dtype=float)
+        vx = feature_value(feature_vector, "vx")
+        vy = feature_value(feature_vector, "vy")
+        yaw_rate = feature_value(feature_vector, "yaw_rate")
+        steer = feature_value(feature_vector, "steer")
         return (
             self.active
             and vx >= self.min_vx

@@ -5,50 +5,59 @@ This document is the pushable summary of the current uncertainty system.
 It focuses on:
 
 1. where the uncertainty comes from,
-2. how it is modeled and injected into the rollout,
-3. what the latest real-data results say,
-4. what is already working well and what still remains weak.
+2. how it is modeled and injected,
+3. what changed in the telemetry-conditioned real-data phase,
+4. what the latest Barcelona and Monza results say.
 
 Read this together with:
 
 - [README.md](README.md)
 - [uncertain_racecar_gym/dataset.py](uncertain_racecar_gym/dataset.py)
+- [uncertain_racecar_gym/features.py](uncertain_racecar_gym/features.py)
 - [uncertain_racecar_gym/deterministic.py](uncertain_racecar_gym/deterministic.py)
 - [uncertain_racecar_gym/uncertainty.py](uncertain_racecar_gym/uncertainty.py)
+- [uncertain_racecar_gym/replay_eval.py](uncertain_racecar_gym/replay_eval.py)
 - [uncertain_racecar_gym/env.py](uncertain_racecar_gym/env.py)
-- [uncertain_racecar_gym/rendering.py](uncertain_racecar_gym/rendering.py)
 
 ## 1. Current status
 
-The repo now has a real-data empirical uncertainty pipeline, not only a synthetic demo path.
+The repo now has a telemetry-conditioned empirical uncertainty pipeline on real Assetto data.
 
-The current uncertainty stack is:
+The current stack is:
 
-- canonicalize offline Assetto laps into a shared schema,
-- run a nominal dynamic bicycle model one step forward,
-- compute one-step residuals,
-- apply a hybrid deterministic calibration first,
-- fit a stochastic empirical residual sampler on the centered leftovers,
-- inject those residuals during Gymnasium rollouts.
+1. canonicalize offline Assetto laps into a shared schema,
+2. preserve richer telemetry channels such as RPM, gear, drive-train speed, longitudinal acceleration, and rear slip,
+3. run a nominal dynamic bicycle model one step forward,
+4. fit a hybrid deterministic calibration first,
+5. fit a stochastic empirical residual sampler on the centered leftovers,
+6. inject those residuals during Gymnasium rollouts,
+7. evaluate both closed-loop divergence and fixed-action replay against held-out real laps.
+
+For the RL-facing API, the nominal observation remains the bicycle-model state plus track context. Signals like `drive_train_speed`, `rpm`, and `gear` stay internal to the uncertainty machinery and are not exposed as policy state.
 
 The latest real-data runs summarized here come from:
 
 - Barcelona `dallara_f317`
 - Monza `dallara_f317`
 
+The current results are after two important corrections:
+
+- unique real-lap trajectory IDs, so different session folders no longer collapse into the same sequence,
+- richer telemetry propagation, so the longitudinal and regime logic can use more physical context than just pose, velocity, and controls.
+
 ## 2. What the uncertainty source is
 
 ### 2.1 Synthetic path
 
-The synthetic path still exists for regression testing.
+The synthetic path still exists for tests and regression checks.
 
 It is generated locally in [uncertain_racecar_gym/dataset.py](uncertain_racecar_gym/dataset.py) by rolling out the nominal model and injecting structured residuals on purpose.
 
 That path is useful for:
 
 - tests,
-- debugging report generation,
-- controlled pipeline regression checks.
+- report/debugging smoke checks,
+- validating that multimodal residual logic does not regress.
 
 ### 2.2 Real Assetto path
 
@@ -56,9 +65,9 @@ The main uncertainty path is now based on offline Assetto laps.
 
 Important point:
 
-- this machine is **not** running live Assetto runtime,
-- the uncertainty is coming from imported trajectory data,
-- the simulator learns empirical residual structure from those imported laps.
+- this machine is not running live Assetto runtime,
+- the uncertainty is learned from imported offline laps,
+- the runtime simulator remains our Gymnasium environment, not Assetto itself.
 
 The canonical ingestion path currently supports:
 
@@ -70,11 +79,13 @@ The canonical ingestion path currently supports:
 
 The canonical schema is the bridge between all uncertainty sources.
 
-Tracked columns include:
+Tracked columns now include:
 
 - state: `x`, `y`, `yaw`, `vx`, `vy`, `yaw_rate`
 - track-relative state: `progress`, `lateral_error`, `heading_error`, `curvature`
 - controls: `steer`, `throttle`, `brake`
+- wheel state: `wheel_rotation`
+- richer telemetry: `accel_x`, `accel_y`, `drive_train_speed`, `rpm`, `gear`, `rear_slip_ratio_mean`, `rear_slip_angle_mean`, `tc_active`, `abs_active`
 - metadata: `trajectory_id`, `track_id`, `car_id`, `frame_index`, `dt`
 
 For each transition, the nominal model predicts one step ahead, then the residual is computed as:
@@ -83,7 +94,7 @@ For each transition, the nominal model predicts one step ahead, then the residua
 - `delta_vy = vy[t+1] - vy_nominal[t+1]`
 - `delta_yaw_rate = yaw_rate[t+1] - yaw_rate_nominal[t+1]`
 
-So the uncertainty model is learning **next-step dynamic mismatch**, not directly randomizing hidden physics parameters.
+So the uncertainty model learns next-step dynamic mismatch, not direct hidden-parameter noise.
 
 ## 4. The current uncertainty model
 
@@ -91,131 +102,170 @@ The stochastic model in [uncertain_racecar_gym/uncertainty.py](uncertain_racecar
 
 Its input is:
 
-- `[curvature, progress, vx, vy, yaw_rate, steer, throttle, brake]`
-- plus a 5-step action history
+- core state/control:
+  - `curvature`, `progress`, `vx`, `vy`, `yaw_rate`, `steer`, `throttle`, `brake`
+- richer telemetry context:
+  - `accel_x`, `accel_y`, `drive_train_speed`, `speed_gap`
+  - `rear_slip_ratio_mean`, `rear_slip_angle_mean`
+  - `gear_norm`, `rpm_norm`
+  - `tc_active`, `abs_active`
+- a 5-step action history
 
 Its output is:
 
-- `[delta_vx, delta_vy, delta_yaw_rate]`
+- `delta_vx`
+- `delta_vy`
+- `delta_yaw_rate`
 
 The current lookup structure is:
 
-- gate by `(track_id, car_id, progress_bin)`,
-- do kNN lookup in normalized feature space inside that gate,
-- sample a real residual example,
-- continue along short blocks for temporal correlation.
+1. gate by `(track_id, car_id, progress_bin)`,
+2. do kNN lookup in normalized feature space inside that gate,
+3. narrow candidates further with a regime key based on control, speed, cornering, and rear-slip behavior,
+4. sample a real residual example,
+5. continue along short blocks for temporal correlation.
 
-The latest change here is important:
+Important runtime details:
 
-- the runtime sampler now keeps a hidden empirical mode key across the rollout,
-- so it does not hop between modes too freely,
-- which makes multimodality persist longer and makes divergence appear earlier.
+- the sampler keeps a hidden empirical mode key across the rollout,
+- it also keeps a global channel mask plus regime-specific channel overrides,
+- so a channel like `delta_vx` can stay active only in the parts of the operating envelope where the held-out data supports it.
 
-In practice, this mode key is derived from trajectory-level structure such as driver/style identity.
+This is why strong non-Gaussian and multi-peak structure can survive without fitting a single Gaussian or GMM.
 
 ## 5. The current deterministic calibration layer
 
-Before the stochastic sampler is fit, the repo now applies a hybrid deterministic calibration stage from [uncertain_racecar_gym/deterministic.py](uncertain_racecar_gym/deterministic.py).
+Before the stochastic sampler is fit, the repo applies a hybrid deterministic calibration stage from [uncertain_racecar_gym/deterministic.py](uncertain_racecar_gym/deterministic.py).
 
 It has two parts:
 
-1. a parametric longitudinal correction for `delta_vx`
-2. a context-conditioned kNN mean residual correction for any structured bias still left after that
+1. a telemetry-conditioned parametric longitudinal correction for `delta_vx`
+2. a context-conditioned kNN mean residual correction for structured bias still left after that
 
-This matters because the first real-data residual tables were mixing together:
+The telemetry-conditioned longitudinal model now uses signals such as:
+
+- `accel_x`
+- `drive_train_speed`
+- `speed_gap`
+- `rear_slip_ratio_mean`
+- `rear_slip_angle_mean`
+- `gear_norm`
+- `rpm_norm`
+
+This matters because the early real-data residuals mixed together:
 
 - true uncertainty,
-- deterministic nominal-model mismatch
+- deterministic nominal-model mismatch.
 
 The hybrid calibration removes a large part of the deterministic bias first, so the remaining residual is a cleaner approximation of the uncertainty we actually want to inject.
 
 ## 6. Latest Barcelona results
 
-Barcelona is still the main reference track for the report pipeline.
+Barcelona remains the main reference track, and the telemetry-conditioned pass is stronger than the previous version.
 
 ### 6.1 Deterministic calibration
 
-The current Barcelona deterministic calibration gives:
+Current Barcelona deterministic calibration:
 
-- `delta_vx` all-data RMSE: `0.585 -> 0.568`
-- `delta_vx` all-data mean |residual|: `0.201 -> 0.119`
-- `delta_vx` stable-driving RMSE: `0.158 -> 0.065`
-- `delta_vx` stable-driving mean |residual|: `0.134 -> 0.044`
-- `delta_vy` mean |residual|: `0.499 -> 0.323`
-- `delta_yaw_rate` mean |residual|: `0.413 -> 0.211`
+- `delta_vx` all-data RMSE: `0.259 -> 0.162`
+- `delta_vx` stable-driving RMSE: `0.212 -> 0.058`
 
 ![Barcelona Longitudinal Focus](docs/uncertainty_assets/barcelona_longitudinal_focus.png)
 
 ![Barcelona Progress Bias Reduction](docs/uncertainty_assets/barcelona_progress_bias_reduction.png)
 
-### 6.2 Stochastic residual quality
+### 6.2 Richer telemetry context
 
-After deterministic centering, Barcelona still shows clearly non-Gaussian residual structure.
+The Barcelona run now explicitly carries drive-train and slip context into the feature vector.
 
-The strongest stochastic evidence is still in the lateral and yaw channels:
+![Barcelona Telemetry Context](docs/uncertainty_assets/barcelona_telemetry_context_plots.png)
 
-- `delta_vy` Wasserstein: `0.323 -> 0.198`
-- `delta_yaw_rate` Wasserstein: `0.211 -> 0.148`
+### 6.3 Stochastic residual quality
 
-For Barcelona, `delta_vx` is still disabled in the stochastic layer after hold-out checking.
+After deterministic centering, Barcelona keeps all three stochastic channels active:
 
-That means:
+- `delta_vx`: on
+- `delta_vy`: on
+- `delta_yaw_rate`: on
 
-- the deterministic `vx` baseline is useful,
-- but the remaining centered `delta_vx` residual is not yet good enough to keep active as a stochastic channel there.
+Held-out Wasserstein improves to:
+
+- `delta_vx`: `0.0400 -> 0.0158`
+- `delta_vy`: `0.1087 -> 0.0518`
+- `delta_yaw_rate`: `0.0734 -> 0.0284`
+
+Active regime counts:
+
+- `delta_vx`: `37`
+- `delta_vy`: `38`
+- `delta_yaw_rate`: `38`
 
 ![Barcelona Sampled Distribution Overlay](docs/uncertainty_assets/barcelona_sampled_distribution_overlay.png)
 
 ![Barcelona Wasserstein Comparison](docs/uncertainty_assets/barcelona_wasserstein_comparison.png)
 
-### 6.3 Multi-peak structure
+![Barcelona Regime Channel Activity](docs/uncertainty_assets/barcelona_regime_channel_activity.png)
+
+![Barcelona Longitudinal Regime Examples](docs/uncertainty_assets/barcelona_longitudinal_regime_examples.png)
+
+### 6.4 Multi-peak structure
 
 Barcelona still contains strong multi-peak empirical slices after conditioning.
 
 Examples found automatically in the latest run include:
 
-- `delta_vx` slices with 4 to 8 peaks,
-- `delta_vy` slices with 5 to 6 peaks,
-- `delta_yaw_rate` slices with 4 to 6 peaks.
+- `delta_vx` slices with up to `7` peaks,
+- `delta_vy` slices with up to `7` peaks,
+- `delta_yaw_rate` slices with up to `5` peaks.
 
 ![Barcelona Multimodal Slices](docs/uncertainty_assets/barcelona_multimodal_slices.png)
 
 ## 7. Latest Monza results
 
-Monza is the first cross-track validation run.
+Monza is the cross-track validation run for the richer telemetry phase.
 
 ### 7.1 Deterministic calibration
 
-The Monza deterministic calibration is stronger than Barcelona:
+Current Monza deterministic calibration:
 
-- `delta_vx` all-data RMSE: `0.310 -> 0.237`
-- `delta_vx` all-data mean |residual|: `0.206 -> 0.046`
-- `delta_vx` stable-driving RMSE: `0.213 -> 0.056`
-- `delta_vx` stable-driving mean |residual|: `0.197 -> 0.029`
-- `delta_vy` mean |residual|: `0.342 -> 0.191`
-- `delta_yaw_rate` mean |residual|: `0.224 -> 0.105`
+- `delta_vx` all-data RMSE: `0.234 -> 0.063`
+- `delta_vx` stable-driving RMSE: `0.235 -> 0.053`
 
 ![Monza Longitudinal Focus](docs/uncertainty_assets/monza_longitudinal_focus.png)
 
-### 7.2 Stochastic residual quality
+### 7.2 Richer telemetry context
 
-Monza is encouraging because all three stochastic channels remain active after calibration.
+![Monza Telemetry Context](docs/uncertainty_assets/monza_telemetry_context_plots.png)
 
-Held-out Wasserstein improves in all three channels:
+### 7.3 Stochastic residual quality
 
-- `delta_vx`: `0.046 -> 0.024`
-- `delta_vy`: `0.191 -> 0.153`
-- `delta_yaw_rate`: `0.105 -> 0.074`
+Monza also keeps all three stochastic channels active.
+
+Held-out Wasserstein improves to:
+
+- `delta_vx`: `0.0330 -> 0.0152`
+- `delta_vy`: `0.1073 -> 0.0690`
+- `delta_yaw_rate`: `0.0661 -> 0.0310`
+
+Active regime counts:
+
+- `delta_vx`: `9`
+- `delta_vy`: `9`
+- `delta_yaw_rate`: `9`
 
 ![Monza Wasserstein Comparison](docs/uncertainty_assets/monza_wasserstein_comparison.png)
 
-### 7.3 Multi-peak structure
+![Monza Regime Channel Activity](docs/uncertainty_assets/monza_regime_channel_activity.png)
 
-Monza also shows multi-peak slices after conditioning:
+![Monza Longitudinal Regime Examples](docs/uncertainty_assets/monza_longitudinal_regime_examples.png)
 
-- `delta_vx` slices with 6 to 8 peaks,
-- `delta_vy` slices with 7 peaks,
-- `delta_yaw_rate` slices with 6 to 8 peaks.
+### 7.4 Multi-peak structure
+
+Monza also shows strong multi-peak slices after conditioning:
+
+- `delta_vx` slices with up to `6` peaks,
+- `delta_vy` slices with up to `8` peaks,
+- `delta_yaw_rate` slices with up to `6` peaks.
 
 ![Monza Multimodal Slices](docs/uncertainty_assets/monza_multimodal_slices.png)
 
@@ -232,96 +282,132 @@ So the uncertainty is:
 
 - state dependent,
 - action dependent,
+- telemetry conditioned,
 - weakly history dependent,
 - temporally correlated over short blocks,
-- and now more mode-consistent over an episode.
+- mode-consistent over a rollout,
+- regime conditioned in which channels are allowed to fire.
 
-## 9. Why the old comparison videos diverged too slowly
+Training-facing uncertainty modes are now:
 
-The earlier videos were too conservative for two reasons.
+- `None` or `"nominal"`: pure nominal dynamic-bicycle rollout
+- `"gaussian"`: fixed zero-mean Gaussian noise on `[delta_vx, delta_vy, delta_yaw_rate, delta_steer]`
+- `"empirical"`: learned empirical residual sampling
 
-### 9.1 The demo controller was too slow
+The Gym API stays standard: use the constructor, `reset(options=...)`, or `env.set_uncertainty(...)`, while `step(action)` remains unchanged for RL libraries.
 
-The old comparison used a simple fixed target-speed driver around `14 m/s`.
+## 9. Closed-loop comparison and replay evaluation
 
-That is far below the real racing-speed envelope in the imported Assetto data, especially on Barcelona and Monza.
+### 9.1 Closed-loop nominal vs empirical divergence
 
-So the same uncertainty looked visually weaker than it really is.
+The latest telemetry-conditioned ghost-comparison runs now diverge much more clearly.
 
-### 9.2 The sampler was not preserving mode strongly enough
+Barcelona profiled run:
 
-The old sampler could mix between modes too quickly, especially when multimodality came from trajectory-level structure.
+- about `0.10 m` separation by step `25`
+- about `2.23 m` separation by step `50`
+- about `5.95 m` separation by step `100`
+- max about `12.43 m`
 
-The hidden mode persistence update helps keep those empirical modes coherent over longer stretches.
+Monza profiled run:
 
-## 10. What changed in the comparison workflow
+- about `0.16 m` separation by step `25`
+- about `0.37 m` separation by step `50`
+- about `1.28 m` separation by step `100`
+- max about `9.19 m`
 
-The comparison rollouts now use a progress-dependent speed-profile driver derived from the real canonical dataset.
-
-This is why the latest videos diverge much earlier.
-
-For example:
-
-- Barcelona profiled run:
-  - about `1.03 m` separation by step `50`
-  - about `7.49 m` separation by step `100`
-- Monza profiled run:
-  - about `0.47 m` separation by step `50`
-  - about `1.98 m` separation by step `100`
-
-The latest tracked preview frames are:
-
-![Barcelona Profiled Comparison Preview](docs/uncertainty_assets/barcelona_profiled_follow_preview.png)
-
-![Monza Profiled Comparison Preview](docs/uncertainty_assets/monza_profiled_follow_preview.png)
-
-In these comparison runs:
+In these comparison videos:
 
 - dark blue solid car = empirical / noise-injected rollout
 - light blue translucent car = calibrated nominal ghost
 
-## 11. Current renderer status
+### 9.2 Fixed-action replay against real data
+
+The repo now also has a replay-based evaluation mode in [uncertain_racecar_gym/replay_eval.py](uncertain_racecar_gym/replay_eval.py).
+
+This replays the recorded Assetto action sequence and compares:
+
+- actual recorded trajectory,
+- nominal rollout,
+- calibrated nominal rollout,
+- empirical rollout.
+
+Barcelona replay evaluation:
+
+- nominal mean position RMSE: about `0.027 m`
+- calibrated mean position RMSE: about `0.021 m`
+- empirical mean position RMSE: about `0.021 m`
+
+Monza replay evaluation:
+
+- nominal mean position RMSE: about `0.014 m`
+- calibrated mean position RMSE: about `0.015 m`
+- empirical mean position RMSE: about `0.015 m`
+
+![Barcelona Replay Aggregate](docs/uncertainty_assets/barcelona_replay_aggregate.png)
+
+![Barcelona Replay Overlay](docs/uncertainty_assets/barcelona_replay_overlay.png)
+
+![Monza Replay Aggregate](docs/uncertainty_assets/monza_replay_aggregate.png)
+
+Interpretation:
+
+- under recorded actions, the simulator can track held-out real laps closely in position,
+- but the dynamic-channel errors are still nontrivial,
+- and in closed-loop controller rollouts the hidden uncertainty can still accumulate into visibly different trajectories.
+
+So replay accuracy and closed-loop divergence are both useful, but they answer different questions.
+
+## 10. Current renderer status
 
 The Tier 1 renderer is still a debug/demo renderer, not the publication renderer.
 
-But it is better than before:
+It is better than before:
 
 - the road surface is now a continuous ribbon mesh,
-- the edge stripes are continuous,
-- the outer shoulder and guardrail bands are continuous too,
-- so the old fragmented-strip look is largely gone.
+- edge stripes and guardrail bands are continuous,
+- the comparison videos are much easier to read.
 
-The publication-quality path is still:
+But it is still not the final publication renderer.
+
+The publication path remains:
 
 1. simulate fast in Gymnasium,
 2. export replay,
 3. render offline in Blender or another higher-fidelity stack.
 
-## 12. Honest limitations
+## 11. Honest limitations
 
-The current strongest limitation is channel asymmetry:
+The current strongest technical limitation is still model fidelity, not basic plumbing.
 
-- Barcelona still wants deterministic `delta_vx` correction but not stochastic `delta_vx`,
-- Monza supports all three stochastic channels,
-- so the longitudinal stochastic story is not equally strong on every track yet.
+More specifically:
 
-The current visual strongest limitation is still fidelity:
+- replay position accuracy is already fairly good on the selected held-out trajectories,
+- but lateral and yaw channel errors remain noticeable in replay diagnostics,
+- the closed-loop divergence strength is still track and controller dependent,
+- the Tier 1 renderer is still functional rather than publication-grade.
 
-- the road mesh is cleaner now,
-- but the whole Tier 1 renderer is still intentionally lightweight.
+Another honest point:
 
-## 13. Most important takeaway
+- the stochastic model is continuous-state-conditioned and clearly non-Gaussian,
+- but it is still a one-step discrete residual sampler, not a continuous-time latent stochastic process model.
+
+## 12. Most important takeaway
 
 The repo now has a real empirical uncertainty pipeline with:
 
 - real offline racing data,
+- richer telemetry-conditioned feature vectors,
 - hybrid deterministic calibration,
-- multi-peak non-Gaussian residuals,
+- corrected unique trajectory IDs for lap ingestion,
+- regime-aware stochastic channel masking,
+- multi-peak non-Gaussian residuals on both Barcelona and Monza,
 - cross-track validation,
-- earlier and more visible nominal-vs-empirical divergence.
+- fixed-action replay evaluation against real data,
+- stronger closed-loop nominal-vs-empirical divergence videos.
 
 That means it is now much closer to the intended use case:
 
 - a Gymnasium API,
 - realistic uncertainty insertion,
-- and nominal controllers that can visibly struggle when the hidden uncertainty is not modeled.
+- and a baseline simulator that can support meaningful nominal-vs-uncertainty-aware controller studies next.
