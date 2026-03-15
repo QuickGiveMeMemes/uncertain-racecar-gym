@@ -27,6 +27,13 @@ uv sync --extra dev
 uv run pytest -q
 ```
 
+For the JAX nominal-training path:
+
+```bash
+uv sync --extra dev --extra jax --extra rl
+uv run --extra jax pytest -q tests/test_jax_env.py
+```
+
 ## Clean Gym API
 
 The training-facing API keeps a standard Gymnasium `step(action)` signature.
@@ -61,6 +68,157 @@ Mode summary:
 - `uncertainty="empirical"`: empirical residual sampler from fitted data artifact
 
 Important: the RL observation stays limited to the bicycle-model state and track context. Signals like `drive_train_speed`, `rpm`, and `gear` are not exposed as policy state.
+
+## JAX nominal env
+
+There is now a partial JAX counterpart for nominal training in [jax_env.py](/Users/ktk/Desktop/mycode/uncertain-racecar-gym/uncertain_racecar_gym/jax_env.py).
+
+This JAX port currently includes:
+
+- track sampling and projection
+- nominal dynamic-bicycle rollout
+- reset / step / observation / reward / termination
+- JIT-friendly pure-state API
+
+It intentionally does not include:
+
+- PyBullet rendering
+- empirical uncertainty
+- replay/report tooling
+
+Example:
+
+```python
+import jax
+import jax.numpy as jnp
+
+from uncertain_racecar_gym.jax_env import NominalJaxRacecarEnv
+
+env = NominalJaxRacecarEnv("package://scenarios/ks_barcelona_layout_gp_dallara_f317_rl_long.yaml")
+key = jax.random.PRNGKey(0)
+
+reset_out = env.reset(key, start_mode="random")
+state = reset_out.state
+obs = reset_out.observation
+
+action = jnp.array([0.0, 0.2, 0.0], dtype=jnp.float32)
+step_out = env.step(state, action)
+
+# JIT-friendly
+step_out = env.step_jit(state, action)
+
+# Explicit benchmark-style reset
+reset_out = env.reset_custom(progress=0.33, lateral_error=0.05, heading_error=-0.02, speed=10.0)
+```
+
+## JAX PPO training
+
+There is now a JAX PPO training pipeline in [ppo_train.py](/Users/ktk/Desktop/mycode/uncertain-racecar-gym/uncertain_racecar_gym/ppo_train.py).
+
+Train a nominal policy on the long-horizon Barcelona scenario and log to wandb:
+
+```bash
+uv run --extra jax --extra rl uncertain-racecar-train-ppo \
+  --scenario package://scenarios/ks_barcelona_layout_gp_dallara_f317_rl_long.yaml \
+  --output-dir output \
+  --run-name ppo_barcelona_nominal_long \
+  --total-timesteps 131072 \
+  --num-envs 32 \
+  --num-steps 128 \
+  --num-minibatches 8 \
+  --update-epochs 4 \
+  --eval-interval-updates 4 \
+  --eval-episodes 4 \
+  --start-mode grid \
+  --bc-epochs 0 \
+  --wandb-project uncertain-racecar-gym-rl
+```
+
+Evaluate a saved checkpoint on nominal, Gaussian, and empirical rollouts:
+
+```bash
+uv run --extra jax --extra rl uncertain-racecar-evaluate-ppo \
+  --checkpoint output/ppo_barcelona_nominal_long/ppo_nominal_policy.pkl \
+  --scenario package://scenarios/ks_barcelona_layout_gp_dallara_f317_rl_long.yaml \
+  --output-dir output/ppo_barcelona_nominal_long_eval \
+  --mode all \
+  --render-steps 2000 \
+  --gaussian-std 0.7 0.45 0.30 0.08 \
+  --empirical-artifact output/barcelona_telemetry_regime_calibrated/stochastic_report/analysis_uncertainty.pkl \
+  --calibration-artifact output/barcelona_telemetry_regime_calibrated/nominal_calibration.pkl \
+  --wandb-project uncertain-racecar-gym-rl
+```
+
+The PPO trainer saves:
+
+- `ppo_nominal_policy.pkl`: best checkpoint
+- `training_history.csv`: per-update metrics
+- `training_curves.png`: learning curves
+- `rl_training_summary.md`: concise training report
+
+## Controller benchmarks
+
+The repo now ships with tracked controller benchmark suites and a generic controller interface so future controllers can be compared against the same nominal / Gaussian / empirical stress tests.
+
+Tracked suites:
+
+- `package://benchmarks/barcelona_nominal_controller_suite.yaml`
+- `package://benchmarks/monza_nominal_controller_suite.yaml`
+
+Run the current PPO baseline on the Barcelona suite:
+
+```bash
+uv run --extra jax --extra rl uncertain-racecar-benchmark \
+  --suite package://benchmarks/barcelona_nominal_controller_suite.yaml \
+  --controller-kind ppo_checkpoint \
+  --checkpoint output/ppo_barcelona_nominal_long/ppo_nominal_policy.pkl \
+  --uncertainty-artifact output/barcelona_telemetry_regime_calibrated/stochastic_report/analysis_uncertainty.pkl \
+  --calibration-artifact output/barcelona_telemetry_regime_calibrated/nominal_calibration.pkl \
+  --output-dir output/controller_benchmark_barcelona \
+  --write-suite output/controller_benchmark_barcelona/resolved_suite.yaml \
+  --package-dir output/controller_benchmark_barcelona/baseline_package
+```
+
+This produces:
+
+- `benchmark_summary.md`
+- `aggregate_metrics.csv`
+- `episode_metrics.csv`
+- `plots/benchmark_dashboard.png`
+- a self-contained `baseline_package/` with copied scenario, track, checkpoint, and uncertainty artifacts
+
+You can also benchmark simpler built-in controllers:
+
+```bash
+uv run uncertain-racecar-benchmark \
+  --suite package://benchmarks/barcelona_nominal_controller_suite.yaml \
+  --controller-kind centerline \
+  --output-dir output/centerline_benchmark
+```
+
+For a future custom controller, implement:
+
+```python
+import numpy as np
+
+
+class MyController:
+    def reset(self, *, seed=None, case_id=None):
+        pass
+
+    def act(self, observation, *, context):
+        return np.array([0.0, 0.2, 0.0], dtype=np.float32)
+```
+
+Then run:
+
+```bash
+uv run uncertain-racecar-benchmark \
+  --suite package://benchmarks/barcelona_nominal_controller_suite.yaml \
+  --controller-kind python \
+  --controller-spec path/to/my_controller.py:MyController \
+  --output-dir output/my_controller_benchmark
+```
 
 ## Demo workflow
 

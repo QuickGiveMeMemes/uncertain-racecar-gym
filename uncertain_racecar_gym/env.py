@@ -142,7 +142,27 @@ class UncertainRacecarEnv(gym.Env):
             return residual_model.gate_prefixes[0]
         return self.scenario.name, "demo_racecar"
 
-    def _initial_state(self, start_mode: str) -> VehicleState:
+    def _initial_state(
+        self,
+        start_mode: str,
+        *,
+        initial_progress: float | None = None,
+        initial_lateral_error: float | None = None,
+        initial_heading_error: float | None = None,
+        initial_speed: float | None = None,
+    ) -> VehicleState:
+        if any(value is not None for value in (initial_progress, initial_lateral_error, initial_heading_error, initial_speed)):
+            progress = float(initial_progress if initial_progress is not None else 0.0) % 1.0
+            lateral_error = float(initial_lateral_error if initial_lateral_error is not None else 0.0)
+            heading_error = float(initial_heading_error if initial_heading_error is not None else 0.0)
+            speed = float(initial_speed if initial_speed is not None else 8.0)
+            return self.dynamics.initial_state(
+                self.track,
+                progress=progress,
+                lateral_error=lateral_error,
+                heading_error=heading_error,
+                speed=speed,
+            )
         if start_mode == "dataset_match" and self.reset_rows is not None and len(self.reset_rows):
             row = self.reset_rows.iloc[int(self.np_random.integers(0, len(self.reset_rows)))]
             return self.dynamics.state_from_canonical_row(row)
@@ -215,8 +235,15 @@ class UncertainRacecarEnv(gym.Env):
         delta = state.progress - previous_progress
         if delta < -0.5:
             delta += 1.0
-        penalty = 0.03 * abs(state.lateral_error) + 0.01 * abs(state.heading_error)
-        return float(delta * 100.0 + 0.05 * state.vx - penalty)
+        penalty = (
+            self.scenario.reward.lateral_error_coef * abs(state.lateral_error)
+            + self.scenario.reward.heading_error_coef * abs(state.heading_error)
+        )
+        return float(
+            delta * self.scenario.reward.progress_coef
+            + self.scenario.reward.speed_coef * state.vx
+            - penalty
+        )
 
     def _gaussian_uncertainty(self) -> tuple[np.ndarray, dict[str, Any]]:
         sample = self.np_random.normal(loc=self.gaussian_noise_mean, scale=self.gaussian_noise_std).astype(float)
@@ -238,7 +265,13 @@ class UncertainRacecarEnv(gym.Env):
             gaussian_noise_std=options.get("gaussian_noise_std"),
             apply_mean_correction=options.get("apply_mean_correction"),
         )
-        self._state = self._initial_state(start_mode)
+        self._state = self._initial_state(
+            start_mode,
+            initial_progress=options.get("initial_progress"),
+            initial_lateral_error=options.get("initial_lateral_error"),
+            initial_heading_error=options.get("initial_heading_error"),
+            initial_speed=options.get("initial_speed"),
+        )
         self._history.clear()
         self._episode_history = []
         self._previous_feature_state = None
@@ -250,6 +283,13 @@ class UncertainRacecarEnv(gym.Env):
             "state": self._render_state(),
             "render_state": self._render_state(),
             "uncertainty": {"mode": self._uncertainty_mode or "none"},
+            "reset": {
+                "start_mode": start_mode,
+                "initial_progress": None if options.get("initial_progress") is None else float(options["initial_progress"]),
+                "initial_lateral_error": None if options.get("initial_lateral_error") is None else float(options["initial_lateral_error"]),
+                "initial_heading_error": None if options.get("initial_heading_error") is None else float(options["initial_heading_error"]),
+                "initial_speed": None if options.get("initial_speed") is None else float(options["initial_speed"]),
+            },
         }
         self._episode_history.append({**self._render_state(), "reward": 0.0, "uncertainty": info["uncertainty"]})
         return obs, info

@@ -90,6 +90,28 @@ def test_env_gaussian_mode_changes_trajectory_and_can_switch_runtime() -> None:
     gaussian.close()
 
 
+def test_env_reset_supports_explicit_initial_conditions() -> None:
+    env = gym.make("UncertainRacecar-v0", renderer=None, uncertainty=None)
+    _, info = env.reset(
+        seed=11,
+        options={
+            "uncertainty_mode": None,
+            "initial_progress": 0.25,
+            "initial_lateral_error": 0.12,
+            "initial_heading_error": -0.03,
+            "initial_speed": 11.5,
+        },
+    )
+    state = env.unwrapped._state
+    assert state is not None
+    assert abs(state.progress - 0.25) < 0.03
+    assert abs(state.lateral_error - 0.12) < 0.02
+    assert abs(state.heading_error + 0.03) < 0.02
+    assert abs(state.vx - 11.5) < 1e-6
+    assert info["reset"]["initial_progress"] == 0.25
+    env.close()
+
+
 def test_fit_from_residual_table_and_gate_resolution(tmp_path: Path) -> None:
     scenario = load_scenario()
     dataset_path = build_demo_dataset(scenario, tmp_path / "demo.parquet", episodes=3, steps_per_episode=25, seed=8)
