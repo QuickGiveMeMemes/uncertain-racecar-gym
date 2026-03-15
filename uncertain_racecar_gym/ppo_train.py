@@ -491,11 +491,14 @@ def render_policy_rollout(
     observation, _ = env.reset(seed=seed, options={"start_mode": "grid"})
     rollout_rows: list[dict[str, Any]] = []
     total_reward = 0.0
+    traveled_distance_m = 0.0
     terminated = False
     truncated = False
     video_path = output_dir / f"{video_name}.mp4"
     video_path.parent.mkdir(parents=True, exist_ok=True)
     writer = imageio.get_writer(video_path, fps=round(1.0 / env.scenario.simulation.dt))
+    prev_x = None
+    prev_y = None
     for step_idx in range(steps):
         obs_array = jnp.asarray(observation, dtype=jnp.float32)
         env_action, _ = deterministic_policy_action(params, obs_norm, obs_array)
@@ -505,6 +508,12 @@ def render_policy_rollout(
         if frame is not None:
             writer.append_data(frame.astype(np.uint8))
         total_reward += float(reward)
+        current_x = float(info["state"]["x"])
+        current_y = float(info["state"]["y"])
+        if prev_x is not None and prev_y is not None:
+            traveled_distance_m += math.hypot(current_x - prev_x, current_y - prev_y)
+        prev_x = current_x
+        prev_y = current_y
         rollout_rows.append(
             {
                 "step": step_idx,
@@ -515,6 +524,7 @@ def render_policy_rollout(
                 "y": float(info["state"]["y"]),
                 "lateral_error": float(env._state.lateral_error if env._state is not None else 0.0),
                 "heading_error": float(env._state.heading_error if env._state is not None else 0.0),
+                "traveled_distance_m": float(traveled_distance_m),
                 "mode": uncertainty_mode or "nominal",
             }
         )
@@ -537,6 +547,7 @@ def render_policy_rollout(
                 f"- Truncated: `{truncated}`",
                 f"- Total reward: `{total_reward:.3f}`",
                 f"- Final progress: `{rollout_rows[-1]['progress'] if rollout_rows else 0.0:.4f}`",
+                f"- Traveled distance: `{traveled_distance_m:.1f} m`",
                 f"- Video: `{video_path.name}`",
                 f"- Rollout JSON: `{json_path.name}`",
             ]
@@ -550,6 +561,7 @@ def render_policy_rollout(
         "json_path": json_path.as_posix(),
         "markdown_path": md_path.as_posix(),
         "total_reward": total_reward,
+        "traveled_distance_m": traveled_distance_m,
         "terminated": bool(terminated),
         "truncated": bool(truncated),
         "steps": len(rollout_rows),
@@ -661,6 +673,7 @@ def _write_summary_markdown(
                 "",
                 f"- Total reward: `{metrics['total_reward']:.3f}`",
                 f"- Final progress: `{metrics['final_progress']:.4f}`",
+                f"- Traveled distance: `{metrics['traveled_distance_m']:.1f} m`",
                 f"- Steps: `{metrics['steps']}`",
                 f"- Terminated: `{metrics['terminated']}`",
                 f"- Truncated: `{metrics['truncated']}`",
@@ -694,6 +707,7 @@ def _write_eval_summary_markdown(
                 "",
                 f"- Reward: `{metrics['total_reward']:.3f}`",
                 f"- Final progress: `{metrics['final_progress']:.4f}`",
+                f"- Traveled distance: `{metrics['traveled_distance_m']:.1f} m`",
                 f"- Steps: `{metrics['steps']}`",
                 f"- Terminated: `{metrics['terminated']}`",
                 f"- Truncated: `{metrics['truncated']}`",

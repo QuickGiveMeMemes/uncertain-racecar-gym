@@ -27,8 +27,10 @@ from uncertain_racecar_gym.controllers import (
     load_python_controller,
 )
 from uncertain_racecar_gym.env import UncertainRacecarEnv
+from uncertain_racecar_gym.mppi_jax import JaxMPPIConfig, JaxMPPIController
 from uncertain_racecar_gym.rendering import PyBulletMirrorRenderer, write_video
 from uncertain_racecar_gym.scenario import Scenario, load_scenario
+from uncertain_racecar_gym.smooth_mppi_jax import JaxSmoothMPPIConfig, JaxSmoothMPPIController
 from uncertain_racecar_gym.track import TrackModel
 
 
@@ -299,6 +301,7 @@ def build_default_stress_suite(
 
 def _build_controller(
     *,
+    scenario: str,
     controller_kind: str,
     checkpoint: str | Path | None = None,
     controller_spec: str | None = None,
@@ -331,6 +334,24 @@ def _build_controller(
             raise ValueError("controller_kind='python' requires --controller-spec.")
         kwargs = json.loads(controller_kwargs_json) if controller_kwargs_json else {}
         return load_python_controller(controller_spec, init_kwargs=kwargs)
+    if controller_kind == "mppi_jax":
+        kwargs = json.loads(controller_kwargs_json) if controller_kwargs_json else {}
+        kwargs.setdefault("scenario", scenario)
+        kwargs.setdefault("driver_dataset", driver_dataset)
+        kwargs.setdefault("speed_profile_quantile", speed_profile_quantile)
+        kwargs.setdefault("speed_profile_scale", speed_profile_scale)
+        kwargs.setdefault("target_speed", target_speed)
+        kwargs.setdefault("min_speed", min_speed)
+        return JaxMPPIController(scenario=kwargs.pop("scenario"), config=JaxMPPIConfig(**kwargs))
+    if controller_kind == "smooth_mppi_jax":
+        kwargs = json.loads(controller_kwargs_json) if controller_kwargs_json else {}
+        kwargs.setdefault("scenario", scenario)
+        kwargs.setdefault("driver_dataset", driver_dataset)
+        kwargs.setdefault("speed_profile_quantile", speed_profile_quantile)
+        kwargs.setdefault("speed_profile_scale", speed_profile_scale)
+        kwargs.setdefault("target_speed", target_speed)
+        kwargs.setdefault("min_speed", min_speed)
+        return JaxSmoothMPPIController(scenario=kwargs.pop("scenario"), config=JaxSmoothMPPIConfig(**kwargs))
     raise ValueError(f"Unsupported controller kind: {controller_kind}")
 
 
@@ -390,7 +411,10 @@ def _run_episode(
     observation, info = env.reset(seed=seed, options=options)
     controller.reset(seed=seed, case_id=case.case_id)
     start_progress = float(env._state.progress if env._state is not None else 0.0)
+    prev_x = float(env._state.x if env._state is not None else 0.0)
+    prev_y = float(env._state.y if env._state is not None else 0.0)
     total_reward = 0.0
+    traveled_distance_m = 0.0
     max_abs_lateral_error = 0.0
     max_abs_heading_error = 0.0
     min_safety_margin = float("inf")
@@ -408,9 +432,29 @@ def _run_episode(
             info=info,
         )
         action = np.asarray(controller.act(observation, context=context), dtype=np.float32)
+        planner_debug = None
+        debug_getter = getattr(controller, "get_render_debug", None)
+        if callable(debug_getter):
+            raw_debug = debug_getter()
+            if raw_debug is not None:
+                planner_debug = {
+                    "candidate_xy": np.asarray(
+                        raw_debug.get("candidate_xy", np.zeros((0, 0, 2), dtype=np.float32)),
+                        dtype=np.float32,
+                    ).copy(),
+                    "final_xy": np.asarray(
+                        raw_debug.get("final_xy", np.zeros((0, 2), dtype=np.float32)),
+                        dtype=np.float32,
+                    ).copy(),
+                }
         observation, reward, terminated, truncated, info = env.step(action)
         total_reward += float(reward)
         assert env._state is not None
+        current_x = float(env._state.x)
+        current_y = float(env._state.y)
+        traveled_distance_m += math.hypot(current_x - prev_x, current_y - prev_y)
+        prev_x = current_x
+        prev_y = current_y
         max_abs_lateral_error = max(max_abs_lateral_error, abs(float(env._state.lateral_error)))
         max_abs_heading_error = max(max_abs_heading_error, abs(float(env._state.heading_error)))
         min_safety_margin = min(min_safety_margin, float(env.track.width * 0.5 - abs(env._state.lateral_error)))
@@ -428,6 +472,7 @@ def _run_episode(
                     "speed": float(env._state.vx),
                     "steering_angle": float(env._state.steer * env.scenario.vehicle.max_steer_rad),
                     "wheel_rotation": float(env._state.wheel_rotation),
+                    "planner_debug": planner_debug,
                 }
             )
         if terminated:
@@ -452,6 +497,7 @@ def _run_episode(
         "outcome": outcome,
         "total_reward": float(total_reward),
         "progress_delta": float(progress_delta),
+        "traveled_distance_m": float(traveled_distance_m),
         "final_progress": float(env._state.progress + env._state.lap_count),
         "lap_count": int(env._state.lap_count),
         "offtrack": float(failure_step is not None),
@@ -471,6 +517,7 @@ def _aggregate_episode_rows(frame: pd.DataFrame) -> pd.DataFrame:
         episodes=("seed", "size"),
         mean_reward=("total_reward", "mean"),
         mean_progress_delta=("progress_delta", "mean"),
+        mean_traveled_distance_m=("traveled_distance_m", "mean"),
         std_progress_delta=("progress_delta", "std"),
         offtrack_rate=("offtrack", "mean"),
         mean_failure_step=("failure_step", "mean"),
@@ -546,12 +593,15 @@ def _render_rollout_video(
     rollout_rows: list[dict[str, Any]],
     output_path: Path,
     render_mode: str,
+    width: int,
+    height: int,
+    stride: int,
 ) -> Path | None:
     if not rollout_rows:
         return None
-    renderer = PyBulletMirrorRenderer(scenario, track, render_mode)
+    renderer = PyBulletMirrorRenderer(scenario, track, render_mode, width=width, height=height)
     frames = []
-    for step_index, row in enumerate(rollout_rows):
+    for step_index, row in enumerate(rollout_rows[:: max(int(stride), 1)]):
         frames.append(
             renderer.render(
                 {
@@ -563,11 +613,13 @@ def _render_rollout_video(
                     "progress": row["progress"],
                     "frame_index": step_index,
                     "speed": row["speed"],
-                }
+                },
+                planner_debug=row.get("planner_debug"),
             )
         )
     renderer.close()
-    write_video(frames, output_path, fps=round(1.0 / scenario.simulation.dt))
+    fps = max(1, round(1.0 / scenario.simulation.dt / max(int(stride), 1)))
+    write_video(frames, output_path, fps=fps)
     return output_path
 
 
@@ -611,7 +663,8 @@ def _write_summary_markdown(
         for row in subset.itertuples(index=False):
             lines.extend(
                 [
-                    f"- `{row.mode}`: progress `{row.mean_progress_delta:.4f} +/- {row.std_progress_delta:.4f}`, off-track `{row.offtrack_rate:.3f}`, "
+                    f"- `{row.mode}`: progress `{row.mean_progress_delta:.4f} +/- {row.std_progress_delta:.4f}`, "
+                    f"distance `{row.mean_traveled_distance_m:.1f} m`, off-track `{row.offtrack_rate:.3f}`, "
                     f"failure step `{row.mean_failure_step:.1f}`, min safety margin `{row.mean_min_safety_margin:.3f} m`",
                 ]
             )
@@ -743,8 +796,12 @@ def run_benchmark(
     package_dir: str | Path | None = None,
     render_cases: Sequence[str] = (),
     render_mode: str = "rgb_array_follow",
+    render_width: int = 640,
+    render_height: int = 360,
+    render_stride: int = 1,
 ) -> BenchmarkArtifacts:
     controller = _build_controller(
+        scenario=suite.scenario,
         controller_kind=controller_kind,
         checkpoint=checkpoint,
         controller_spec=controller_spec,
@@ -817,6 +874,9 @@ def run_benchmark(
                 rollout_rows=rollout_rows,
                 output_path=video_path,
                 render_mode=render_mode,
+                width=render_width,
+                height=render_height,
+                stride=render_stride,
             )
             if rendered is not None:
                 video_paths.append(rendered.as_posix())
@@ -861,7 +921,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--suite", default=None, help="Benchmark suite YAML. If omitted, auto-generate from --scenario.")
     parser.add_argument("--scenario", default="package://scenarios/ks_barcelona_layout_gp_dallara_f317_rl_long.yaml")
     parser.add_argument("--output-dir", default="output/benchmark_run")
-    parser.add_argument("--controller-kind", default="ppo_checkpoint", choices=["ppo_checkpoint", "centerline", "profiled_centerline", "python"])
+    parser.add_argument("--controller-kind", default="ppo_checkpoint", choices=["ppo_checkpoint", "centerline", "profiled_centerline", "python", "mppi_jax", "smooth_mppi_jax"])
     parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--controller-spec", default=None)
     parser.add_argument("--controller-kwargs-json", default=None)
@@ -879,6 +939,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--package-dir", default=None, help="Optional self-contained baseline bundle output directory.")
     parser.add_argument("--render-cases", nargs="*", default=[])
     parser.add_argument("--render-mode", default="rgb_array_follow")
+    parser.add_argument("--render-width", type=int, default=640)
+    parser.add_argument("--render-height", type=int, default=360)
+    parser.add_argument("--render-stride", type=int, default=1)
     return parser
 
 
@@ -906,6 +969,9 @@ def benchmark_main(argv: list[str] | None = None) -> None:
         package_dir=args.package_dir,
         render_cases=tuple(args.render_cases),
         render_mode=args.render_mode,
+        render_width=args.render_width,
+        render_height=args.render_height,
+        render_stride=args.render_stride,
     )
     print(
         json.dumps(

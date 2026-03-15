@@ -1,245 +1,189 @@
 # uncertain-racecar-gym
 
-A racecar-focused Gymnasium environment with:
+`uncertain-racecar-gym` is a racing-focused Gymnasium environment for studying the gap between:
 
-- a nominal dynamic-bicycle simulator
-- an empirical uncertainty model fitted from canonicalized trajectory data
-- real-time 3D PyBullet rendering
-- offline replay bundle export for higher-fidelity review workflows
+- a clean nominal dynamic-bicycle model,
+- simple Gaussian disturbance models,
+- and data-driven empirical uncertainty learned from offline [Assetto Corsa](https://github.com/dasGringuen/assetto_corsa_gym?tab=readme-ov-file#train-sac-from-demonstrations-using-an-ensemble-of-buffers) laps.
 
-## Rendering status
+The repo is set up so you can:
 
-The current saved MP4s are **Tier 1 diagnostic renders**, not the final publication-quality output path.
+- train a controller on the nominal model,
+- evaluate the same controller under nominal / Gaussian / empirical uncertainty,
+- render 3D diagnostic videos,
+- and benchmark multiple controllers on the same stress-test suite.
 
-- Tier 1:
-  - real-time PyBullet mirror rendering
-  - good for debugging, controller inspection, and quick comparisons
-- Tier 2:
-  - replay export for offline scene work
-  - intended path for publication-ready animation quality
+Right now the repository already includes:
 
-For a deeper explanation of the current renderer quality gap and the uncertainty model itself, see [UNCERTAINTY_TECHNICAL_README.md](/Users/ktk/Desktop/mycode/uncertain-racecar-gym/UNCERTAINTY_TECHNICAL_README.md). For the latest telemetry-conditioned real-data review package, start with [phase_12_telemetry_and_replay_eval.md](/Users/ktk/Desktop/mycode/uncertain-racecar-gym/output/phase_12_telemetry_and_replay_eval.md).
+- a standard Gymnasium API,
+- a JAX nominal environment for fast rollout and RL training,
+- a telemetry-conditioned empirical residual model,
+- a Tier 1 PyBullet renderer,
+- a JAX PPO baseline,
+- a JAX [MPPI](https://arxiv.org/abs/1707.02342) baseline,
+- a JAX [Smooth MPPI](https://arxiv.org/abs/2112.09988) baseline,
+- and a controller benchmark harness.
 
-## Quick start
+For the long technical explanation of the uncertainty pipeline, see [UNCERTAINTY_TECHNICAL_README.md](UNCERTAINTY_TECHNICAL_README.md).
+
+## What the simulator does
+
+At its core, the environment rolls out a nominal dynamic bicycle model with action:
+
+- `steer_cmd`
+- `throttle_cmd`
+- `brake_cmd`
+
+The observable racing state stays compact and controller-friendly:
+
+- `progress`
+- `lateral_error`
+- `heading_error`
+- `vx`
+- `vy`
+- `yaw_rate`
+- current / lookahead curvature
+- recent action history
+
+Internally, the simulator can optionally inject uncertainty into the next-step dynamics. This is useful when a controller was designed on the clean nominal model but must be tested against realistic mismatch at evaluation time.
+
+## Install with `uv`
+
+Python `>=3.11` is required.
+
+Minimal install:
 
 ```bash
 uv sync --extra dev
 uv run pytest -q
 ```
 
-For the JAX nominal-training path:
+Full install for JAX training, PPO, and JAX MPC:
 
 ```bash
 uv sync --extra dev --extra jax --extra rl
-uv run --extra jax pytest -q tests/test_jax_env.py
+uv run --extra dev --extra jax --extra rl pytest -q
 ```
 
-## Clean Gym API
+## Quick start
 
-The training-facing API keeps a standard Gymnasium `step(action)` signature.
-
-Switch uncertainty with the env constructor, `reset(options=...)`, or `env.unwrapped.set_uncertainty(...)`:
+Basic Gym usage:
 
 ```python
 import gymnasium as gym
 import uncertain_racecar_gym  # registers UncertainRacecar-v0
 
-env = gym.make("UncertainRacecar-v0", uncertainty=None)
-obs, info = env.reset(seed=0)
-
-# Pure nominal rollout
-obs, reward, terminated, truncated, info = env.step(action)
-
-# Switch to fixed Gaussian uncertainty on [delta_vx, delta_vy, delta_yaw_rate, delta_steer]
-env.unwrapped.set_uncertainty("gaussian", gaussian_noise_std=[0.12, 0.08, 0.05, 0.015])
-
-# Switch to empirical uncertainty
 env = gym.make(
     "UncertainRacecar-v0",
-    uncertainty="empirical",
-    uncertainty_artifact="path/to/analysis_uncertainty.pkl",
+    scenario="package://scenarios/ks_barcelona_layout_gp_dallara_f317_rl_long.yaml",
+    uncertainty=None,
 )
+
+obs, info = env.reset(seed=0)
+obs, reward, terminated, truncated, info = env.step([0.0, 0.2, 0.0])
 ```
 
-Mode summary:
-
-- `uncertainty=None` or `"nominal"`: pure dynamic-bicycle rollout
-- `uncertainty="gaussian"`: zero-mean Gaussian perturbation on modeled dynamic states
-- `uncertainty="empirical"`: empirical residual sampler from fitted data artifact
-
-Important: the RL observation stays limited to the bicycle-model state and track context. Signals like `drive_train_speed`, `rpm`, and `gear` are not exposed as policy state.
-
-## JAX nominal env
-
-There is now a partial JAX counterpart for nominal training in [jax_env.py](/Users/ktk/Desktop/mycode/uncertain-racecar-gym/uncertain_racecar_gym/jax_env.py).
-
-This JAX port currently includes:
-
-- track sampling and projection
-- nominal dynamic-bicycle rollout
-- reset / step / observation / reward / termination
-- JIT-friendly pure-state API
-
-It intentionally does not include:
-
-- PyBullet rendering
-- empirical uncertainty
-- replay/report tooling
+Switch uncertainty modes either in the constructor, at reset, or through `env.unwrapped.set_uncertainty(...)`.
 
 Example:
 
 ```python
-import jax
-import jax.numpy as jnp
+# pure nominal rollout
+env.unwrapped.set_uncertainty(None)
 
-from uncertain_racecar_gym.jax_env import NominalJaxRacecarEnv
+# fixed Gaussian disturbance
+env.unwrapped.set_uncertainty(
+    "gaussian",
+    gaussian_noise_std=[0.12, 0.08, 0.05, 0.015],
+)
 
-env = NominalJaxRacecarEnv("package://scenarios/ks_barcelona_layout_gp_dallara_f317_rl_long.yaml")
-key = jax.random.PRNGKey(0)
-
-reset_out = env.reset(key, start_mode="random")
-state = reset_out.state
-obs = reset_out.observation
-
-action = jnp.array([0.0, 0.2, 0.0], dtype=jnp.float32)
-step_out = env.step(state, action)
-
-# JIT-friendly
-step_out = env.step_jit(state, action)
-
-# Explicit benchmark-style reset
-reset_out = env.reset_custom(progress=0.33, lateral_error=0.05, heading_error=-0.02, speed=10.0)
+# empirical residual disturbance
+env.unwrapped.set_uncertainty(
+    "empirical",
+    uncertainty_artifact="path/to/analysis_uncertainty.pkl",
+    calibration_artifact="path/to/nominal_calibration.pkl",
+)
 ```
 
-## JAX PPO training
+## Uncertainty modes
 
-There is now a JAX PPO training pipeline in [ppo_train.py](/Users/ktk/Desktop/mycode/uncertain-racecar-gym/uncertain_racecar_gym/ppo_train.py).
+There are three intended rollout modes:
 
-Train a nominal policy on the long-horizon Barcelona scenario and log to wandb:
+- `uncertainty=None` or `"nominal"`
+  - pure dynamic-bicycle rollout
+- `uncertainty="gaussian"`
+  - zero-mean fixed-variance perturbation on modeled next-step dynamics
+- `uncertainty="empirical"`
+  - data-driven residual sampling conditioned on state, action, track location, and telemetry context
 
-```bash
-uv run --extra jax --extra rl uncertain-racecar-train-ppo \
-  --scenario package://scenarios/ks_barcelona_layout_gp_dallara_f317_rl_long.yaml \
-  --output-dir output \
-  --run-name ppo_barcelona_nominal_long \
-  --total-timesteps 131072 \
-  --num-envs 32 \
-  --num-steps 128 \
-  --num-minibatches 8 \
-  --update-epochs 4 \
-  --eval-interval-updates 4 \
-  --eval-episodes 4 \
-  --start-mode grid \
-  --bc-epochs 0 \
-  --wandb-project uncertain-racecar-gym-rl
-```
+### What gets injected in Gaussian mode
 
-Evaluate a saved checkpoint on nominal, Gaussian, and empirical rollouts:
+Gaussian mode perturbs the modeled dynamic channels:
 
-```bash
-uv run --extra jax --extra rl uncertain-racecar-evaluate-ppo \
-  --checkpoint output/ppo_barcelona_nominal_long/ppo_nominal_policy.pkl \
-  --scenario package://scenarios/ks_barcelona_layout_gp_dallara_f317_rl_long.yaml \
-  --output-dir output/ppo_barcelona_nominal_long_eval \
-  --mode all \
-  --render-steps 2000 \
-  --gaussian-std 0.7 0.45 0.30 0.08 \
-  --empirical-artifact output/barcelona_telemetry_regime_calibrated/stochastic_report/analysis_uncertainty.pkl \
-  --calibration-artifact output/barcelona_telemetry_regime_calibrated/nominal_calibration.pkl \
-  --wandb-project uncertain-racecar-gym-rl
-```
+- `delta_vx`
+- `delta_vy`
+- `delta_yaw_rate`
+- `delta_steer`
 
-The PPO trainer saves:
+with zero-mean, fixed user-provided standard deviations.
 
-- `ppo_nominal_policy.pkl`: best checkpoint
-- `training_history.csv`: per-update metrics
-- `training_curves.png`: learning curves
-- `rl_training_summary.md`: concise training report
+### What gets injected in empirical mode
 
-## Controller benchmarks
+Empirical mode does **not** inject a single Gaussian.
 
-The repo now ships with tracked controller benchmark suites and a generic controller interface so future controllers can be compared against the same nominal / Gaussian / empirical stress tests.
+It does:
 
-Tracked suites:
+1. run the nominal bicycle model one step forward,
+2. optionally apply a deterministic mean correction learned from real data,
+3. sample a residual from a continuous empirical model,
+4. add that residual to the next-step dynamics.
 
-- `package://benchmarks/barcelona_nominal_controller_suite.yaml`
-- `package://benchmarks/monza_nominal_controller_suite.yaml`
+The empirical residual output channels are:
 
-Run the current PPO baseline on the Barcelona suite:
+- `delta_vx`
+- `delta_vy`
+- `delta_yaw_rate`
 
-```bash
-uv run --extra jax --extra rl uncertain-racecar-benchmark \
-  --suite package://benchmarks/barcelona_nominal_controller_suite.yaml \
-  --controller-kind ppo_checkpoint \
-  --checkpoint output/ppo_barcelona_nominal_long/ppo_nominal_policy.pkl \
-  --uncertainty-artifact output/barcelona_telemetry_regime_calibrated/stochastic_report/analysis_uncertainty.pkl \
-  --calibration-artifact output/barcelona_telemetry_regime_calibrated/nominal_calibration.pkl \
-  --output-dir output/controller_benchmark_barcelona \
-  --write-suite output/controller_benchmark_barcelona/resolved_suite.yaml \
-  --package-dir output/controller_benchmark_barcelona/baseline_package
-```
+The empirical model conditions on:
 
-This produces:
+- track location and curvature,
+- vehicle state,
+- action,
+- recent action history,
+- and internal telemetry context such as acceleration, rear slip, drive-train speed, RPM, and gear.
 
-- `benchmark_summary.md`
-- `aggregate_metrics.csv`
-- `episode_metrics.csv`
-- `plots/benchmark_dashboard.png`
-- a self-contained `baseline_package/` with copied scenario, track, checkpoint, and uncertainty artifacts
+Those telemetry channels are used to model uncertainty, but they are **not** exposed as policy observation.
 
-You can also benchmark simpler built-in controllers:
+### What kind of empirical noise this is
 
-```bash
-uv run uncertain-racecar-benchmark \
-  --suite package://benchmarks/barcelona_nominal_controller_suite.yaml \
-  --controller-kind centerline \
-  --output-dir output/centerline_benchmark
-```
+The current empirical model is:
 
-For a future custom controller, implement:
+- non-Gaussian,
+- multimodal,
+- regime-conditioned,
+- and temporally correlated.
 
-```python
-import numpy as np
+It is built from real Assetto offline laps rather than hand-picked random noise.
 
+Barcelona examples from the current tracked analysis:
 
-class MyController:
-    def reset(self, *, seed=None, case_id=None):
-        pass
+![Barcelona multimodal slices](docs/uncertainty_assets/barcelona_multimodal_slices.png)
 
-    def act(self, observation, *, context):
-        return np.array([0.0, 0.2, 0.0], dtype=np.float32)
-```
+This plot shows real state-conditioned residual slices with multiple peaks, which is exactly the kind of structure that a single Gaussian would miss.
 
-Then run:
+![Barcelona sampled distribution overlay](docs/uncertainty_assets/barcelona_sampled_distribution_overlay.png)
 
-```bash
-uv run uncertain-racecar-benchmark \
-  --suite package://benchmarks/barcelona_nominal_controller_suite.yaml \
-  --controller-kind python \
-  --controller-spec path/to/my_controller.py:MyController \
-  --output-dir output/my_controller_benchmark
-```
+This plot shows that the empirical sampler follows the held-out residual distributions much more closely than a simple unimodal approximation.
 
-## Demo workflow
+![Barcelona Wasserstein comparison](docs/uncertainty_assets/barcelona_wasserstein_comparison.png)
 
-Build a synthetic canonical dataset:
+This plot summarizes the held-out distribution matching improvement after calibration plus stochastic sampling.
 
-```bash
-uv run uncertain-racecar-build-dataset \
-  --output output/demo_dataset.parquet \
-  --demo-episodes 2 \
-  --steps-per-episode 50
-```
+For more detail, including the exact model structure and replay evaluation, see [UNCERTAINTY_TECHNICAL_README.md](UNCERTAINTY_TECHNICAL_README.md).
 
-Fit the empirical uncertainty artifact:
+## Running the main code paths
 
-```bash
-uv run uncertain-racecar-fit-uncertainty \
-  --input output/demo_dataset.parquet \
-  --output output/demo_uncertainty.pkl
-```
-
-Record nominal and empirical rollouts:
+### 1. Record a nominal / Gaussian / empirical rollout
 
 ```bash
 uv run uncertain-racecar-record-rollout \
@@ -263,10 +207,11 @@ uv run uncertain-racecar-record-rollout \
   --steps 140 \
   --render-mode rgb_array_follow \
   --uncertainty-mode empirical \
-  --uncertainty-artifact output/demo_uncertainty.pkl
+  --uncertainty-artifact PATH_TO_ANALYSIS_UNCERTAINTY_PKL \
+  --calibration-artifact PATH_TO_NOMINAL_CALIBRATION_PKL
 ```
 
-Export the replay bundle:
+### 2. Export a replay bundle
 
 ```bash
 uv run uncertain-racecar-export-replay \
@@ -275,73 +220,186 @@ uv run uncertain-racecar-export-replay \
   --video-path output/empirical_rollout.mp4
 ```
 
-Generate the uncertainty analysis report with plots:
+### 3. JAX nominal environment
+
+The nominal JAX environment is in [jax_env.py](uncertain_racecar_gym/jax_env.py).
+
+Example:
+
+```python
+import jax
+import jax.numpy as jnp
+
+from uncertain_racecar_gym.jax_env import NominalJaxRacecarEnv
+
+env = NominalJaxRacecarEnv("package://scenarios/ks_barcelona_layout_gp_dallara_f317_rl_long.yaml")
+key = jax.random.PRNGKey(0)
+
+reset_out = env.reset(key, start_mode="random")
+state = reset_out.state
+obs = reset_out.observation
+
+action = jnp.array([0.0, 0.2, 0.0], dtype=jnp.float32)
+step_out = env.step_jit(state, action)
+```
+
+## Controllers and algorithms
+
+The current built-in baselines are:
+
+- JAX PPO
+- JAX MPPI
+- JAX Smooth MPPI
+
+All three are intended to use **nominal planning/training information only**. Noise is injected only by the actual environment at evaluation time.
+
+### PPO baseline
+
+Train a nominal PPO policy and log to wandb:
+
+```bash
+uv run --extra jax --extra rl uncertain-racecar-train-ppo \
+  --scenario package://scenarios/ks_barcelona_layout_gp_dallara_f317_rl_long.yaml \
+  --output-dir output \
+  --run-name ppo_barcelona_nominal_long \
+  --total-timesteps 131072 \
+  --num-envs 32 \
+  --num-steps 128 \
+  --num-minibatches 8 \
+  --update-epochs 4 \
+  --eval-interval-updates 4 \
+  --eval-episodes 4 \
+  --start-mode grid \
+  --bc-epochs 0 \
+  --wandb-project uncertain-racecar-gym-rl
+```
+
+Evaluate a saved PPO checkpoint:
+
+```bash
+uv run --extra jax --extra rl uncertain-racecar-evaluate-ppo \
+  --checkpoint output/ppo_barcelona_nominal_long/ppo_nominal_policy.pkl \
+  --scenario package://scenarios/ks_barcelona_layout_gp_dallara_f317_rl_long.yaml \
+  --output-dir output/ppo_barcelona_nominal_long_eval \
+  --mode all \
+  --render-steps 2000 \
+  --gaussian-std 0.7 0.45 0.30 0.08 \
+  --empirical-artifact PATH_TO_ANALYSIS_UNCERTAINTY_PKL \
+  --calibration-artifact PATH_TO_NOMINAL_CALIBRATION_PKL \
+  --wandb-project uncertain-racecar-gym-rl
+```
+
+### MPPI baseline
+
+```bash
+uv run --extra jax uncertain-racecar-benchmark \
+  --suite package://benchmarks/barcelona_nominal_controller_suite.yaml \
+  --controller-kind mppi_jax \
+  --controller-kwargs-json '{"horizon": 28, "num_samples": 384, "optimization_steps": 2, "replan_interval": 2, "driver_dataset": "output/barcelona_real/barcelona_real_canonical.parquet", "target_speed": 20.0, "min_speed": 9.0, "speed_profile_scale": 0.82, "speed_profile_quantile": 0.72, "lateral_weight": 24.0, "heading_weight": 14.0}' \
+  --uncertainty-artifact PATH_TO_ANALYSIS_UNCERTAINTY_PKL \
+  --calibration-artifact PATH_TO_NOMINAL_CALIBRATION_PKL \
+  --output-dir output/mppi_barcelona_suite
+```
+
+### Smooth MPPI baseline
+
+```bash
+uv run --extra jax uncertain-racecar-benchmark \
+  --suite package://benchmarks/barcelona_nominal_controller_suite.yaml \
+  --controller-kind smooth_mppi_jax \
+  --controller-kwargs-json '{"horizon": 28, "num_samples": 384, "optimization_steps": 2, "replan_interval": 2, "driver_dataset": "output/barcelona_real/barcelona_real_canonical.parquet", "target_speed": 20.0, "min_speed": 9.0, "speed_profile_scale": 0.82, "speed_profile_quantile": 0.72, "lateral_weight": 24.0, "heading_weight": 14.0, "action_diff_weight": 0.9, "delta_noise_std": [0.10, 0.08, 0.05], "delta_action_bounds": [0.26, 0.18, 0.14]}' \
+  --uncertainty-artifact PATH_TO_ANALYSIS_UNCERTAINTY_PKL \
+  --calibration-artifact PATH_TO_NOMINAL_CALIBRATION_PKL \
+  --output-dir output/smooth_mppi_barcelona_suite
+```
+
+## Benchmarking controllers
+
+The benchmark harness lets you compare controllers on the same suite under:
+
+- nominal
+- Gaussian
+- empirical
+
+Tracked suites:
+
+- `package://benchmarks/barcelona_nominal_controller_suite.yaml`
+- `package://benchmarks/monza_nominal_controller_suite.yaml`
+
+Run the PPO baseline on the Barcelona suite:
+
+```bash
+uv run --extra jax --extra rl uncertain-racecar-benchmark \
+  --suite package://benchmarks/barcelona_nominal_controller_suite.yaml \
+  --controller-kind ppo_checkpoint \
+  --checkpoint output/ppo_barcelona_nominal_long/ppo_nominal_policy.pkl \
+  --uncertainty-artifact PATH_TO_ANALYSIS_UNCERTAINTY_PKL \
+  --calibration-artifact PATH_TO_NOMINAL_CALIBRATION_PKL \
+  --output-dir output/controller_benchmark_barcelona \
+  --write-suite output/controller_benchmark_barcelona/resolved_suite.yaml \
+  --package-dir output/controller_benchmark_barcelona/baseline_package
+```
+
+The benchmark outputs include:
+
+- `benchmark_summary.md`
+- `aggregate_metrics.csv`
+- `episode_metrics.csv`
+- `plots/benchmark_dashboard.png`
+
+Important test-time metrics include:
+
+- `mean_progress_delta`
+- `mean_traveled_distance_m`
+- `offtrack_rate`
+- `mean_failure_step`
+- `mean_max_abs_lateral_error`
+- `mean_min_safety_margin`
+
+The traveled-distance metric is useful because it separates:
+
+- a controller that fails early after driving fast,
+- from a controller that fails early while never building pace.
+
+## Data and uncertainty workflow
+
+### Synthetic demo workflow
+
+Build a synthetic canonical dataset:
+
+```bash
+uv run uncertain-racecar-build-dataset \
+  --output output/demo_dataset.parquet \
+  --demo-episodes 2 \
+  --steps-per-episode 50
+```
+
+Fit the uncertainty artifact:
+
+```bash
+uv run uncertain-racecar-fit-uncertainty \
+  --input output/demo_dataset.parquet \
+  --output output/demo_uncertainty.pkl
+```
+
+Analyze the uncertainty model:
 
 ```bash
 uv run uncertain-racecar-analyze-uncertainty --output-dir output
 ```
 
-Replay recorded actions against actual data:
+### Real Assetto offline workflow
 
-```bash
-uv run uncertain-racecar-replay-evaluate \
-  --scenario output/barcelona_real/ks_barcelona_layout_gp_dallara_f317.yaml \
-  --dataset output/barcelona_telemetry_real/barcelona_real_canonical.parquet \
-  --output-dir output/barcelona_telemetry_regime_calibrated/replay_eval \
-  --calibration-artifact output/barcelona_telemetry_regime_calibrated/nominal_calibration.pkl \
-  --uncertainty-artifact output/barcelona_telemetry_regime_calibrated/stochastic_report/analysis_uncertainty.pkl
-```
+The intended order is:
 
-## Assetto-style ingestion
-
-The dataset builder now accepts two Assetto-style offline formats:
-
-- plugin telemetry pickles with `{"telemetry": [...], "static_info": {...}}`
-- converted state pickles with `{"states": [...], "static_info": {...}}`
-
-Build a canonical parquet from one or more Assetto logs:
-
-```bash
-uv run uncertain-racecar-build-dataset \
-  --scenario uncertain_racecar_gym/assets/scenarios/sample_oval.yaml \
-  --output output/assetto_canonical.parquet \
-  path/to/telemetry_001.pkl \
-  path/to/telemetry_002.pkl
-```
-
-If `static_info` contains `TrackName`, `TrackConfiguration`, and `CarName`, the builder will infer `track_id` and `car_id` automatically. You can still override them:
-
-```bash
-uv run uncertain-racecar-build-dataset \
-  --scenario uncertain_racecar_gym/assets/scenarios/sample_oval.yaml \
-  --output output/assetto_canonical.parquet \
-  --track-id ks_barcelona-layout_gp \
-  --car-id dallara_f317 \
-  path/to/lap.pkl
-```
-
-Analyze a canonical real-data parquet directly:
-
-```bash
-uv run uncertain-racecar-analyze-uncertainty \
-  --output-dir output \
-  --dataset output/assetto_canonical.parquet \
-  --source-description "canonical Assetto telemetry dataset"
-```
-
-Note: the scenario centerline must match the track used to collect the logs, otherwise the projected `progress`, `lateral_error`, and `curvature` fields will be wrong.
-
-## Real Assetto workflow
-
-For real Assetto data, the intended order is:
-
-1. reconstruct a track centerline from progress-labeled laps,
+1. reconstruct a track centerline from laps,
 2. write a matching scenario YAML,
-3. build the canonical parquet,
-4. fit and analyze the empirical uncertainty model,
-5. record rollout videos and export replay bundles.
+3. canonicalize the offline laps,
+4. calibrate the nominal model,
+5. fit the empirical uncertainty artifact,
+6. benchmark controllers.
 
-Example commands:
+Example:
 
 ```bash
 uv run uncertain-racecar-build-track \
@@ -360,27 +418,37 @@ uv run uncertain-racecar-analyze-uncertainty \
   --scenario output/barcelona_real/ks_barcelona_layout_gp_dallara_f317.yaml \
   --output-dir output/barcelona_real/report \
   --dataset output/barcelona_real/barcelona_real_canonical.parquet \
-  --source-description "Real Assetto Corsa Barcelona / dallara_f317 state-pickle subset"
+  --source-description "Real Assetto Corsa Barcelona / dallara_f317 subset"
 ```
 
-The current example outputs from that workflow are already available here:
+The dataset builder accepts:
 
-- [phase_5_barcelona_real_data.md](/Users/ktk/Desktop/mycode/uncertain-racecar-gym/output/phase_5_barcelona_real_data.md)
-- [phase_6_dtfix_and_multimodal_report.md](/Users/ktk/Desktop/mycode/uncertain-racecar-gym/output/phase_6_dtfix_and_multimodal_report.md)
-- [phase_7_calibrated_nominal_and_ghost_compare.md](/Users/ktk/Desktop/mycode/uncertain-racecar-gym/output/phase_7_calibrated_nominal_and_ghost_compare.md)
-- [phase_8_hybrid_longitudinal_calibration.md](/Users/ktk/Desktop/mycode/uncertain-racecar-gym/output/phase_8_hybrid_longitudinal_calibration.md)
-- [phase_9_cross_track_uncertainty_and_renderer.md](/Users/ktk/Desktop/mycode/uncertain-racecar-gym/output/phase_9_cross_track_uncertainty_and_renderer.md)
-- [phase_10_regime_conditioned_uncertainty.md](/Users/ktk/Desktop/mycode/uncertain-racecar-gym/output/phase_10_regime_conditioned_uncertainty.md)
-- [phase_11_trajectory_id_fix.md](/Users/ktk/Desktop/mycode/uncertain-racecar-gym/output/phase_11_trajectory_id_fix.md)
-- [phase_12_telemetry_and_replay_eval.md](/Users/ktk/Desktop/mycode/uncertain-racecar-gym/output/phase_12_telemetry_and_replay_eval.md)
-- [track_report.md](/Users/ktk/Desktop/mycode/uncertain-racecar-gym/output/barcelona_real/track_report/track_report.md)
-- [telemetry-conditioned Barcelona uncertainty_report.md](/Users/ktk/Desktop/mycode/uncertain-racecar-gym/output/barcelona_telemetry_regime_calibrated/stochastic_report/uncertainty_report.md)
-- [telemetry-conditioned Monza uncertainty_report.md](/Users/ktk/Desktop/mycode/uncertain-racecar-gym/output/monza_telemetry_regime_calibrated/stochastic_report/uncertainty_report.md)
-- [Barcelona replay_eval_report.md](/Users/ktk/Desktop/mycode/uncertain-racecar-gym/output/barcelona_telemetry_regime_calibrated/replay_eval/replay_eval_report.md)
-- [Monza replay_eval_report.md](/Users/ktk/Desktop/mycode/uncertain-racecar-gym/output/monza_telemetry_regime_calibrated/replay_eval/replay_eval_report.md)
+- telemetry pickles with `telemetry` and `static_info`
+- converted state pickles with `states` and `static_info`
+- already-built canonical parquet files
+
+## Rendering status
+
+The current saved MP4s are **Pybullet diagnostic renders**, not the final publication renderer.
+
+- Current
+  - real-time PyBullet mirror rendering
+  - useful for debugging, controller comparison, and saved MP4s
+- WIP
+  - replay export for later offline cinematic rendering
+  - intended path for publication-quality videos
 
 ## Project layout
 
-- `uncertain_racecar_gym/`: package code, packaged assets, CLI entry points
-- `tests/`: focused tests for the new repo only
-- `output/`: ignored local artifacts for videos, logs, datasets, and replay bundles
+- `uncertain_racecar_gym/`
+  - package code, controllers, JAX env, renderer, assets, and CLIs
+- `tests/`
+  - focused repo tests
+- `docs/uncertainty_assets/`
+  - tracked plots used by the documentation
+- `output/`
+  - ignored local artifacts for videos, logs, datasets, replay bundles, and benchmark results
+
+## Useful follow-up docs
+
+- [UNCERTAINTY_TECHNICAL_README.md](UNCERTAINTY_TECHNICAL_README.md)

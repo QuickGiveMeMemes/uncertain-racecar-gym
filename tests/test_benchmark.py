@@ -52,6 +52,7 @@ def test_benchmark_smoke_with_centerline_controller(tmp_path: Path) -> None:
     aggregate = pd.read_csv(artifacts.aggregate_csv_path)
     assert set(aggregate["case_id"]) == {"full_lap_short", "custom_turn_in"}
     assert set(aggregate["mode"]) == {"nominal", "gaussian"}
+    assert "mean_traveled_distance_m" in aggregate.columns
 
     loaded_suite = load_benchmark_suite(artifacts.suite_path)
     assert loaded_suite.name == suite.name
