@@ -59,10 +59,18 @@ class JaxSimulationParams(NamedTuple):
     history_template: Array
 
 
+class JaxRewardParams(NamedTuple):
+    progress_coef: Array
+    speed_coef: Array
+    lateral_error_coef: Array
+    heading_error_coef: Array
+
+
 class NominalJaxEnvParams(NamedTuple):
     track: JaxTrackData
     vehicle: JaxVehicleParams
     simulation: JaxSimulationParams
+    reward: JaxRewardParams
 
 
 class JaxRacecarState(NamedTuple):
@@ -227,11 +235,14 @@ def _observation(params: NominalJaxEnvParams, state: JaxRacecarState) -> Array:
     )
 
 
-def _reward(previous_progress: Array, state: JaxRacecarState) -> Array:
+def _reward(params: NominalJaxEnvParams, previous_progress: Array, state: JaxRacecarState) -> Array:
     delta = state.progress - previous_progress
     delta = jnp.where(delta < -0.5, delta + 1.0, delta)
-    penalty = 0.03 * jnp.abs(state.lateral_error) + 0.01 * jnp.abs(state.heading_error)
-    return delta * 100.0 + 0.05 * state.vx - penalty
+    penalty = (
+        params.reward.lateral_error_coef * jnp.abs(state.lateral_error)
+        + params.reward.heading_error_coef * jnp.abs(state.heading_error)
+    )
+    return delta * params.reward.progress_coef + params.reward.speed_coef * state.vx - penalty
 
 
 def reset_nominal(
@@ -251,6 +262,24 @@ def reset_nominal(
         heading_error = jnp.asarray(0.0, dtype=jnp.float32)
         speed = jnp.asarray(8.0, dtype=jnp.float32)
     state = _initial_state(params, progress, lateral_error, heading_error, speed)
+    return JaxResetOutput(state=state, observation=_observation(params, state))
+
+
+def reset_nominal_custom(
+    params: NominalJaxEnvParams,
+    *,
+    progress: Array,
+    lateral_error: Array = jnp.asarray(0.0, dtype=jnp.float32),
+    heading_error: Array = jnp.asarray(0.0, dtype=jnp.float32),
+    speed: Array = jnp.asarray(8.0, dtype=jnp.float32),
+) -> JaxResetOutput:
+    state = _initial_state(
+        params,
+        jnp.mod(jnp.asarray(progress, dtype=jnp.float32), 1.0),
+        jnp.asarray(lateral_error, dtype=jnp.float32),
+        jnp.asarray(heading_error, dtype=jnp.float32),
+        jnp.maximum(jnp.asarray(speed, dtype=jnp.float32), 0.0),
+    )
     return JaxResetOutput(state=state, observation=_observation(params, state))
 
 
@@ -321,7 +350,7 @@ def step_nominal(
         step_count=state.step_count + jnp.asarray(1, dtype=jnp.int32),
         action_history=next_history,
     )
-    reward = _reward(state.progress, next_state)
+    reward = _reward(params, state.progress, next_state)
     terminated = jnp.abs(next_state.lateral_error) > params.track.road_half_width
     truncated = next_state.step_count >= params.simulation.max_steps
     return JaxStepOutput(
@@ -381,6 +410,12 @@ def build_nominal_jax_params(scenario: str | Scenario | None = None) -> tuple[No
             ),
             history_template=jnp.zeros((resolved_scenario.uncertainty.history_length, 3), dtype=jnp.float32),
         ),
+        reward=JaxRewardParams(
+            progress_coef=jnp.asarray(resolved_scenario.reward.progress_coef, dtype=jnp.float32),
+            speed_coef=jnp.asarray(resolved_scenario.reward.speed_coef, dtype=jnp.float32),
+            lateral_error_coef=jnp.asarray(resolved_scenario.reward.lateral_error_coef, dtype=jnp.float32),
+            heading_error_coef=jnp.asarray(resolved_scenario.reward.heading_error_coef, dtype=jnp.float32),
+        ),
     )
     return params, resolved_scenario
 
@@ -392,10 +427,35 @@ class NominalJaxRacecarEnv:
         self.observation_size = int(7 + len(self.params.simulation.lookahead_offsets) + self.params.simulation.history_template.size)
         self.reset_grid_jit = jax.jit(lambda key: reset_nominal(self.params, key, start_mode="grid"))
         self.reset_random_jit = jax.jit(lambda key: reset_nominal(self.params, key, start_mode="random"))
+        self.reset_custom_jit = jax.jit(
+            lambda progress, lateral_error, heading_error, speed: reset_nominal_custom(
+                self.params,
+                progress=progress,
+                lateral_error=lateral_error,
+                heading_error=heading_error,
+                speed=speed,
+            )
+        )
         self.step_jit = jax.jit(lambda state, action: step_nominal(self.params, state, action))
 
     def reset(self, key: Array, start_mode: str = "grid") -> JaxResetOutput:
         return reset_nominal(self.params, key, start_mode=start_mode)
+
+    def reset_custom(
+        self,
+        *,
+        progress: float,
+        lateral_error: float = 0.0,
+        heading_error: float = 0.0,
+        speed: float = 8.0,
+    ) -> JaxResetOutput:
+        return reset_nominal_custom(
+            self.params,
+            progress=jnp.asarray(progress, dtype=jnp.float32),
+            lateral_error=jnp.asarray(lateral_error, dtype=jnp.float32),
+            heading_error=jnp.asarray(heading_error, dtype=jnp.float32),
+            speed=jnp.asarray(speed, dtype=jnp.float32),
+        )
 
     def step(self, state: JaxRacecarState, action: Array) -> JaxStepOutput:
         return step_nominal(self.params, state, action)

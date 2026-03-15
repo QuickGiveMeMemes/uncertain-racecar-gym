@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+import importlib
+import importlib.util
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Mapping, Protocol
+
 import numpy as np
 import pandas as pd
 
@@ -84,3 +90,89 @@ class ProfiledCenterlineDriver:
         throttle = float(np.clip(speed_error * 0.18, 0.0, 1.0))
         brake = float(np.clip(-speed_error * 0.18, 0.0, 1.0))
         return np.array([steer, throttle, brake], dtype=np.float32)
+
+
+@dataclass(slots=True)
+class ControllerStepContext:
+    observation: np.ndarray
+    step_index: int
+    episode_index: int
+    case_id: str
+    mode: str | None
+    env: Any | None = None
+    info: Mapping[str, Any] | None = None
+
+
+class BenchmarkController(Protocol):
+    name: str
+
+    def reset(self, *, seed: int | None = None, case_id: str | None = None) -> None: ...
+
+    def act(self, observation: np.ndarray, *, context: ControllerStepContext) -> np.ndarray: ...
+
+
+class DriverControllerAdapter:
+    def __init__(self, driver: CenterlineDriver | ProfiledCenterlineDriver, name: str | None = None):
+        self.driver = driver
+        self.name = name or type(driver).__name__
+
+    def reset(self, *, seed: int | None = None, case_id: str | None = None) -> None:
+        return None
+
+    def act(self, observation: np.ndarray, *, context: ControllerStepContext) -> np.ndarray:
+        if context.env is None or getattr(context.env, "_state", None) is None:
+            raise ValueError("DriverControllerAdapter requires a live env with an initialized `_state`.")
+        action = self.driver.act(context.env._state, context.env.track)
+        return np.asarray(action, dtype=np.float32)
+
+
+class PPOCheckpointController:
+    def __init__(self, checkpoint_path: str | Path, name: str | None = None):
+        self.checkpoint_path = Path(checkpoint_path)
+        self.name = name or self.checkpoint_path.stem
+        import jax
+        import jax.numpy as jnp
+
+        from uncertain_racecar_gym.ppo_train import load_checkpoint
+
+        payload = load_checkpoint(self.checkpoint_path)
+        self.params = payload["params"]
+        self.obs_norm = payload["obs_norm"]
+        from uncertain_racecar_gym.ppo_train import deterministic_policy_action
+
+        self._policy_fn = jax.jit(
+            lambda observation: deterministic_policy_action(self.params, self.obs_norm, observation)[0]
+        )
+        obs_dim = int(np.asarray(self.obs_norm.mean).shape[0])
+        self._policy_fn(jnp.zeros((obs_dim,), dtype=jnp.float32))
+
+    def reset(self, *, seed: int | None = None, case_id: str | None = None) -> None:
+        return None
+
+    def act(self, observation: np.ndarray, *, context: ControllerStepContext) -> np.ndarray:
+        import jax.numpy as jnp
+        env_action = self._policy_fn(jnp.asarray(observation, dtype=jnp.float32))
+        return np.asarray(env_action, dtype=np.float32)
+
+
+def load_python_controller(spec: str, init_kwargs: dict[str, Any] | None = None) -> BenchmarkController:
+    module_name, _, class_name = spec.partition(":")
+    if not class_name:
+        raise ValueError("Python controller spec must be '<module_or_path>:<ClassName>'.")
+    if module_name.endswith(".py") or Path(module_name).exists():
+        module_path = Path(module_name).resolve()
+        dynamic_name = f"custom_controller_{module_path.stem}"
+        module_spec = importlib.util.spec_from_file_location(dynamic_name, module_path)
+        if module_spec is None or module_spec.loader is None:
+            raise ImportError(f"Unable to load controller module from {module_path}")
+        module = importlib.util.module_from_spec(module_spec)
+        module_spec.loader.exec_module(module)
+    else:
+        module = importlib.import_module(module_name)
+    controller_cls = getattr(module, class_name)
+    controller = controller_cls(**(init_kwargs or {}))
+    if not hasattr(controller, "act"):
+        raise TypeError(f"Controller class {class_name} must define an act(...) method.")
+    if not hasattr(controller, "reset"):
+        raise TypeError(f"Controller class {class_name} must define a reset(...) method.")
+    return controller

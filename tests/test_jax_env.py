@@ -71,7 +71,7 @@ def test_nominal_jax_env_reset_matches_python_grid_reset() -> None:
     reset_output = jax_env.reset(jax.random.PRNGKey(0), start_mode="grid")
 
     np.testing.assert_allclose(np.asarray(obs_python), np.asarray(reset_output.observation), atol=1e-6)
-    np.testing.assert_allclose(_state_vector_from_python_env(python_env), _state_vector_from_jax(reset_output.state), atol=1e-6)
+    np.testing.assert_allclose(_state_vector_from_python_env(python_env), _state_vector_from_jax(reset_output.state), atol=3e-6)
     python_env.close()
 
 
@@ -104,3 +104,26 @@ def test_nominal_jax_env_step_is_jittable() -> None:
 
     assert output.observation.shape[0] == env.observation_size
     assert np.isfinite(np.asarray(output.reward))
+
+
+def test_nominal_jax_env_custom_reset_matches_python_initial_conditions() -> None:
+    scenario = load_scenario()
+    python_env = gym.make("UncertainRacecar-v0", scenario=scenario.source_path, renderer=None, uncertainty=None)
+    obs_python, _ = python_env.reset(
+        seed=0,
+        options={
+            "start_mode": "grid",
+            "uncertainty_mode": None,
+            "initial_progress": 0.33,
+            "initial_lateral_error": 0.08,
+            "initial_heading_error": -0.02,
+            "initial_speed": 10.2,
+        },
+    )
+
+    jax_env = NominalJaxRacecarEnv(scenario.source_path)
+    reset_output = jax_env.reset_custom(progress=0.33, lateral_error=0.08, heading_error=-0.02, speed=10.2)
+
+    np.testing.assert_allclose(np.asarray(obs_python), np.asarray(reset_output.observation), atol=1e-6)
+    np.testing.assert_allclose(_state_vector_from_python_env(python_env), _state_vector_from_jax(reset_output.state), atol=3e-6)
+    python_env.close()

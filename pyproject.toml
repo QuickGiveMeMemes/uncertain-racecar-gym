@@ -27,6 +27,10 @@ dev = [
 jax = [
   "jax>=0.4.35,<1.0",
 ]
+rl = [
+  "optax>=0.2.5,<1.0",
+  "wandb>=0.19,<1.0",
+]
 
 [project.scripts]
 uncertain-racecar-build-dataset = "uncertain_racecar_gym.cli:build_dataset_main"
@@ -38,6 +42,9 @@ uncertain-racecar-compare-rollouts = "uncertain_racecar_gym.cli:compare_rollouts
 uncertain-racecar-export-replay = "uncertain_racecar_gym.cli:export_replay_main"
 uncertain-racecar-analyze-uncertainty = "uncertain_racecar_gym.cli:analyze_uncertainty_main"
 uncertain-racecar-replay-evaluate = "uncertain_racecar_gym.cli:replay_evaluate_main"
+uncertain-racecar-benchmark = "uncertain_racecar_gym.benchmark:benchmark_main"
+uncertain-racecar-train-ppo = "uncertain_racecar_gym.ppo_train:train_ppo_main"
+uncertain-racecar-evaluate-ppo = "uncertain_racecar_gym.ppo_train:train_ppo_main"
 
 [tool.setuptools.packages.find]
 include = ["uncertain_racecar_gym*"]
