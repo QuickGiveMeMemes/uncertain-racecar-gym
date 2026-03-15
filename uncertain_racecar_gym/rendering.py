@@ -7,6 +7,7 @@ from pathlib import Path
 import imageio.v2 as imageio
 import numpy as np
 import pybullet as p
+from PIL import Image, ImageDraw
 
 from uncertain_racecar_gym.common import package_asset_path
 from uncertain_racecar_gym.scenario import Scenario
@@ -282,7 +283,76 @@ class PyBulletMirrorRenderer:
         projection = p.computeProjectionMatrixFOV(fov=60.0, aspect=float(self.width) / float(self.height), nearVal=0.05, farVal=100.0)
         return view, projection
 
-    def render(self, render_state: dict, comparison_state: dict | None = None) -> np.ndarray | None:
+    @staticmethod
+    def _matrix4(values: list[float] | tuple[float, ...]) -> np.ndarray:
+        return np.asarray(values, dtype=np.float32).reshape((4, 4), order="F")
+
+    def _project_xy(self, xy_points: np.ndarray, view: list[float] | tuple[float, ...], projection: list[float] | tuple[float, ...]) -> np.ndarray:
+        if xy_points.size == 0:
+            return np.zeros((0, 2), dtype=np.float32)
+        view_matrix = self._matrix4(view)
+        projection_matrix = self._matrix4(projection)
+        points = np.asarray(xy_points, dtype=np.float32)
+        homogeneous = np.concatenate(
+            [
+                points,
+                np.full((points.shape[0], 1), 0.28, dtype=np.float32),
+                np.ones((points.shape[0], 1), dtype=np.float32),
+            ],
+            axis=1,
+        )
+        clip = (projection_matrix @ view_matrix @ homogeneous.T).T
+        w = np.maximum(clip[:, 3:4], 1e-6)
+        ndc = clip[:, :3] / w
+        pixels = np.empty((points.shape[0], 2), dtype=np.float32)
+        pixels[:, 0] = (ndc[:, 0] * 0.5 + 0.5) * float(self.width - 1)
+        pixels[:, 1] = (1.0 - (ndc[:, 1] * 0.5 + 0.5)) * float(self.height - 1)
+        valid = np.logical_and.reduce(
+            [
+                clip[:, 3] > 1e-6,
+                ndc[:, 2] > -1.5,
+                ndc[:, 2] < 1.5,
+            ]
+        )
+        pixels[~valid] = np.nan
+        return pixels
+
+    def _overlay_planner_debug(
+        self,
+        frame: np.ndarray,
+        planner_debug: dict | None,
+        view: list[float] | tuple[float, ...],
+        projection: list[float] | tuple[float, ...],
+    ) -> np.ndarray:
+        if planner_debug is None:
+            return frame
+        image = Image.fromarray(frame.astype(np.uint8), mode="RGB").convert("RGBA")
+        draw = ImageDraw.Draw(image, "RGBA")
+
+        candidate_xy = np.asarray(planner_debug.get("candidate_xy", np.zeros((0, 0, 2), dtype=np.float32)), dtype=np.float32)
+        final_xy = np.asarray(planner_debug.get("final_xy", np.zeros((0, 2), dtype=np.float32)), dtype=np.float32)
+
+        for trajectory in candidate_xy:
+            pixels = self._project_xy(trajectory, view, projection)
+            pixels = pixels[np.all(np.isfinite(pixels), axis=1)]
+            if len(pixels) >= 2:
+                draw.line([tuple(point) for point in pixels], fill=(84, 180, 255, 46), width=1)
+
+        if len(final_xy) >= 2:
+            pixels = self._project_xy(final_xy, view, projection)
+            pixels = pixels[np.all(np.isfinite(pixels), axis=1)]
+            if len(pixels) >= 2:
+                draw.line([tuple(point) for point in pixels], fill=(255, 184, 44, 255), width=4)
+                draw.line([tuple(point) for point in pixels], fill=(255, 236, 180, 176), width=2)
+
+        return np.asarray(image.convert("RGB"), dtype=np.uint8)
+
+    def render(
+        self,
+        render_state: dict,
+        comparison_state: dict | None = None,
+        planner_debug: dict | None = None,
+    ) -> np.ndarray | None:
         mode = self.render_mode.replace("rgb_array_", "")
         if self.render_mode == "human" and p.getConnectionInfo(self.client_id)["connectionMethod"] == p.GUI:
             self.update(render_state, comparison_state=comparison_state)
@@ -314,7 +384,8 @@ class PyBulletMirrorRenderer:
                 projectionMatrix=projection,
                 physicsClientId=self.client_id,
             )
-        return np.reshape(rgb, (self.height, self.width, 4))[:, :, :3]
+        frame = np.reshape(rgb, (self.height, self.width, 4))[:, :, :3]
+        return self._overlay_planner_debug(frame, planner_debug, view, projection)
 
     def close(self) -> None:
         if self.client_id is not None:

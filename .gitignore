@@ -4,6 +4,7 @@ PLAN.md
 # Reference repositories kept locally only
 assetto_corsa_gym/
 racecar_gym/
+smooth-mppi-pytorch/
 
 # Python environments
 .venv/
