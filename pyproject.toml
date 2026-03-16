@@ -40,6 +40,7 @@ uncertain-racecar-calibrate-nominal = "uncertain_racecar_gym.cli:calibrate_nomin
 uncertain-racecar-record-rollout = "uncertain_racecar_gym.cli:record_rollout_main"
 uncertain-racecar-compare-rollouts = "uncertain_racecar_gym.cli:compare_rollouts_main"
 uncertain-racecar-export-replay = "uncertain_racecar_gym.cli:export_replay_main"
+uncertain-racecar-render-blender = "uncertain_racecar_gym.cli:render_blender_main"
 uncertain-racecar-analyze-uncertainty = "uncertain_racecar_gym.cli:analyze_uncertainty_main"
 uncertain-racecar-replay-evaluate = "uncertain_racecar_gym.cli:replay_evaluate_main"
 uncertain-racecar-benchmark = "uncertain_racecar_gym.benchmark:benchmark_main"

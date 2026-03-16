@@ -220,7 +220,25 @@ uv run uncertain-racecar-export-replay \
   --video-path output/empirical_rollout.mp4
 ```
 
-### 3. JAX nominal environment
+### 3. Render a Tier 2 Blender clip
+
+If Blender is installed locally, you can render the replay bundle into a higher-quality offline clip:
+
+```bash
+uv run uncertain-racecar-render-blender \
+  --bundle-dir output/empirical_replay_bundle \
+  --output-path output/empirical_blender_preview.mp4 \
+  --engine BLENDER_EEVEE \
+  --samples 64 \
+  --resolution-x 960 \
+  --resolution-y 544 \
+  --frame-limit 120 \
+  --save-blend-path output/empirical_blender_preview.blend
+```
+
+For a slower but higher-quality path, switch `--engine CYCLES`.
+
+### 4. JAX nominal environment
 
 The nominal JAX environment is in [jax_env.py](uncertain_racecar_gym/jax_env.py).
 
@@ -435,7 +453,8 @@ The current saved MP4s are **Pybullet diagnostic renders**, not the final public
   - real-time PyBullet mirror rendering
   - useful for debugging, controller comparison, and saved MP4s
 - WIP
-  - replay export for later offline cinematic rendering
+  - replay export plus Blender rendering for later offline cinematic rendering
+  - the repo now includes a headless Blender CLI: `uncertain-racecar-render-blender`
   - intended path for publication-quality videos
 
 ## Project layout
