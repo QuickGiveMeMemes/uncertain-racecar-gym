@@ -1,28 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import asdict
 import json
 from pathlib import Path
-import shutil
-
-import numpy as np
 
 from uncertain_racecar_gym.common import ensure_dir
 from uncertain_racecar_gym.scenario import Scenario
-
-
-def _json_ready(value):
-    if isinstance(value, dict):
-        return {str(key): _json_ready(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_json_ready(item) for item in value]
-    if isinstance(value, Path):
-        return value.as_posix()
-    if isinstance(value, np.ndarray):
-        return value.tolist()
-    if isinstance(value, np.generic):
-        return value.item()
-    return value
 
 
 def export_replay_bundle(
@@ -37,27 +19,16 @@ def export_replay_bundle(
     manifest_path = bundle_dir / "scene_manifest.json"
     camera_path = bundle_dir / "camera_script.json"
     readme_path = bundle_dir / "README.md"
-    track_path = bundle_dir / "track_centerline.csv"
-    scenario_path = bundle_dir / "scenario.yaml"
 
-    trajectory_path.write_text(json.dumps(_json_ready(history), indent=2), encoding="utf-8")
-    shutil.copyfile(Path(scenario.track.csv), track_path)
-    shutil.copyfile(scenario.source_path, scenario_path)
+    trajectory_path.write_text(json.dumps(history, indent=2), encoding="utf-8")
     manifest_path.write_text(
         json.dumps(
             {
                 "scenario": scenario.name,
-                "track_csv": track_path.name,
-                "scenario_yaml": scenario_path.name,
+                "track_csv": scenario.track.csv,
                 "vehicle_asset": "package://vehicles/simple_racecar.urdf",
                 "video_path": str(video_path) if video_path else None,
                 "frame_count": len(history),
-                "simulation_dt": float(scenario.simulation.dt),
-                "fps": int(round(1.0 / scenario.simulation.dt)),
-                "track": asdict(scenario.track),
-                "vehicle": asdict(scenario.vehicle),
-                "simulation": asdict(scenario.simulation),
-                "uncertainty": asdict(scenario.uncertainty),
             },
             indent=2,
         ),
@@ -84,11 +55,10 @@ def export_replay_bundle(
                 "This bundle contains the simulator trajectory, camera script, and scene metadata for offline rendering.",
                 "",
                 "Suggested workflow:",
-                "1. Build the track mesh from `track_centerline.csv`.",
-                "2. Reconstruct the vehicle using the dimensions in `scene_manifest.json`.",
+                "1. Import or reference the packaged vehicle asset.",
+                "2. Build the track mesh from the centerline CSV in `scene_manifest.json`.",
                 "3. Animate the vehicle using `trajectory.json`.",
                 "4. Apply the shot plan from `camera_script.json`.",
-                "5. Render with the Blender automation in `uncertain_racecar_gym/assets/blender/render_replay.py`.",
             ]
         ),
         encoding="utf-8",

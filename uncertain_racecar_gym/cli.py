@@ -9,7 +9,6 @@ import pandas as pd
 from uncertain_racecar_gym.calibration import generate_nominal_calibration_package
 from uncertain_racecar_gym.controllers import CenterlineDriver, ProfiledCenterlineDriver
 from uncertain_racecar_gym.analysis import generate_default_report
-from uncertain_racecar_gym.blender_render import BlenderRenderConfig, render_replay_bundle
 from uncertain_racecar_gym.dataset import build_canonical_dataset, build_demo_dataset
 from uncertain_racecar_gym.env import UncertainRacecarEnv
 from uncertain_racecar_gym.replay import export_replay_bundle
@@ -340,40 +339,6 @@ def export_replay_main(argv: list[str] | None = None) -> int:
     history = json.loads(Path(args.rollout_json).read_text(encoding="utf-8"))
     bundle = export_replay_bundle(history, scenario, args.output_dir, video_path=args.video_path)
     print(bundle)
-    return 0
-
-
-def render_blender_main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Render a replay bundle with Blender.")
-    parser.add_argument("--bundle-dir", required=True)
-    parser.add_argument("--output-path", required=True)
-    parser.add_argument("--blender-executable", default=None)
-    parser.add_argument("--vehicle-asset", default=None, help="Optional external GLB/GLTF vehicle mesh. Defaults to the bundled Kenney Racing Kit car.")
-    parser.add_argument("--engine", default="BLENDER_EEVEE", choices=["BLENDER_EEVEE_NEXT", "BLENDER_EEVEE", "CYCLES"])
-    parser.add_argument("--samples", type=int, default=96)
-    parser.add_argument("--resolution-x", type=int, default=1280)
-    parser.add_argument("--resolution-y", type=int, default=720)
-    parser.add_argument("--frame-limit", type=int, default=None)
-    parser.add_argument("--save-blend-path", default=None)
-    parser.add_argument("--dry-run", action="store_true")
-    args = parser.parse_args(argv)
-
-    result = render_replay_bundle(
-        BlenderRenderConfig(
-            bundle_dir=Path(args.bundle_dir),
-            output_path=Path(args.output_path),
-            blender_executable=Path(args.blender_executable) if args.blender_executable else None,
-            vehicle_asset=Path(args.vehicle_asset) if args.vehicle_asset else None,
-            engine=args.engine,
-            samples=args.samples,
-            resolution_x=args.resolution_x,
-            resolution_y=args.resolution_y,
-            frame_limit=args.frame_limit,
-            save_blend_path=Path(args.save_blend_path) if args.save_blend_path else None,
-            dry_run=args.dry_run,
-        )
-    )
-    print(json.dumps(result, indent=2))
     return 0
 
 
