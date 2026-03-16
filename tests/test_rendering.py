@@ -6,6 +6,7 @@ import json
 import numpy as np
 
 from uncertain_racecar_gym.cli import export_replay_main, record_rollout_main
+from uncertain_racecar_gym.replay import export_replay_bundle
 from uncertain_racecar_gym.rendering import PyBulletMirrorRenderer
 from uncertain_racecar_gym.scenario import load_scenario
 from uncertain_racecar_gym.track import TrackModel
@@ -48,6 +49,13 @@ def test_record_rollout_and_export(tmp_path: Path) -> None:
     assert rc == 0
     assert (output_dir / "bundle" / "trajectory.json").exists()
     assert (output_dir / "bundle" / "scene_manifest.json").exists()
+    assert (output_dir / "bundle" / "track_centerline.csv").exists()
+    assert (output_dir / "bundle" / "scenario.yaml").exists()
+    manifest = json.loads((output_dir / "bundle" / "scene_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["track_csv"] == "track_centerline.csv"
+    assert manifest["scenario_yaml"] == "scenario.yaml"
+    assert manifest["track"]["width"] > 0.0
+    assert manifest["fps"] >= 1
 
 
 def test_renderer_planner_overlay_smoke() -> None:
@@ -79,3 +87,27 @@ def test_renderer_planner_overlay_smoke() -> None:
     renderer.close()
     assert frame is not None
     assert frame.shape == (180, 320, 3)
+
+
+def test_export_replay_bundle_serializes_planner_debug_numpy(tmp_path: Path) -> None:
+    scenario = load_scenario("package://scenarios/sample_oval.yaml")
+    bundle_dir = export_replay_bundle(
+        [
+            {
+                "x": 0.0,
+                "y": 0.0,
+                "yaw": 0.0,
+                "steering_angle": 0.0,
+                "wheel_rotation": 0.0,
+                "planner_debug": {
+                    "candidate_xy": np.asarray([[[0.0, 0.0], [1.0, 0.1]]], dtype=np.float32),
+                    "final_xy": np.asarray([[0.0, 0.0], [1.0, 0.0]], dtype=np.float32),
+                },
+            }
+        ],
+        scenario,
+        tmp_path / "bundle",
+    )
+    payload = json.loads((bundle_dir / "trajectory.json").read_text(encoding="utf-8"))
+    assert payload[0]["planner_debug"]["candidate_xy"][0][1] == [1.0, 0.10000000149011612]
+    assert payload[0]["planner_debug"]["final_xy"][1] == [1.0, 0.0]
