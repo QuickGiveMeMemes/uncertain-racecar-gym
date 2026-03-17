@@ -56,6 +56,7 @@ datasets/
 *.npz
 *.npy
 *.csv
+!uncertain_racecar_gym/assets/tracks/*.csv
 *.tsv
 *.h5
 *.hdf5
