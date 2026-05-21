@@ -43,11 +43,15 @@ class TrackModel:
         extended = np.vstack([self.centerline, self.centerline[0]])
         self._segments = np.diff(extended, axis=0)
         self._segment_lengths = np.linalg.norm(self._segments, axis=1)
+        self._segment_length_sq = self._segment_lengths * self._segment_lengths
+        self._segment_valid = self._segment_lengths > 1e-9
+        self._segment_tangents = self._segments / np.maximum(self._segment_lengths[:, None], 1e-9)
+        self._segment_normals = np.stack([-self._segment_tangents[:, 1], self._segment_tangents[:, 0]], axis=1)
+        self._segment_headings = np.arctan2(self._segments[:, 1], self._segments[:, 0])
         self._cumulative = np.concatenate([[0.0], np.cumsum(self._segment_lengths)])
         self.length = float(self._cumulative[-1])
 
-        headings = np.arctan2(self._segments[:, 1], self._segments[:, 0])
-        self._headings = np.append(headings, headings[0])
+        self._headings = np.append(self._segment_headings, self._segment_headings[0])
 
         arc = self._cumulative[:-1]
         heading_unwrapped = np.unwrap(self._headings[:-1])
@@ -93,35 +97,34 @@ class TrackModel:
         )
 
     def project(self, x: float, y: float) -> TrackProjection:
-        point = np.array([x, y], dtype=float)
-        best_distance = float("inf")
-        best_projection = None
-        for index, segment in enumerate(self._segments):
-            p0 = self.centerline[index]
-            seg_len = self._segment_lengths[index]
-            if seg_len < 1e-9:
-                continue
-            t = np.clip(np.dot(point - p0, segment) / (seg_len * seg_len), 0.0, 1.0)
-            projected = p0 + t * segment
-            distance = float(np.linalg.norm(point - projected))
-            if distance < best_distance:
-                tangent = segment / seg_len
-                normal = np.array([-tangent[1], tangent[0]])
-                signed_offset = float(np.dot(point - projected, normal))
-                arc = self._cumulative[index] + t * seg_len
-                best_distance = distance
-                best_projection = TrackProjection(
-                    progress=self.arc_to_progress(arc),
-                    arc_length=arc,
-                    x=float(projected[0]),
-                    y=float(projected[1]),
-                    heading=float(np.arctan2(segment[1], segment[0])),
-                    lateral_error=signed_offset,
-                    curvature=float(np.interp(arc, self._arc_samples, self._curvature_samples, period=self.length)),
-                )
-        if best_projection is None:
+        point = np.asarray([x, y], dtype=float)
+        delta_from_start = point - self.centerline
+        t = np.divide(
+            np.einsum("ij,ij->i", delta_from_start, self._segments),
+            self._segment_length_sq,
+            out=np.zeros_like(self._segment_lengths),
+            where=self._segment_valid,
+        )
+        t = np.clip(t, 0.0, 1.0)
+        projected = self.centerline + self._segments * t[:, None]
+        delta = point - projected
+        distance_sq = np.einsum("ij,ij->i", delta, delta)
+        distance_sq = np.where(self._segment_valid, distance_sq, np.inf)
+        index = int(np.argmin(distance_sq))
+        if not np.isfinite(distance_sq[index]):
             raise RuntimeError("Unable to project point onto track.")
-        return best_projection
+
+        signed_offset = float(np.dot(point - projected[index], self._segment_normals[index]))
+        arc = float(self._cumulative[index] + t[index] * self._segment_lengths[index])
+        return TrackProjection(
+            progress=self.arc_to_progress(arc),
+            arc_length=arc,
+            x=float(projected[index, 0]),
+            y=float(projected[index, 1]),
+            heading=float(self._segment_headings[index]),
+            lateral_error=signed_offset,
+            curvature=float(np.interp(arc, self._arc_samples, self._curvature_samples, period=self.length)),
+        )
 
     def spawn_pose(self, progress: float, lateral_error: float = 0.0, heading_error: float = 0.0) -> tuple[float, float, float]:
         projection = self.sample(progress)

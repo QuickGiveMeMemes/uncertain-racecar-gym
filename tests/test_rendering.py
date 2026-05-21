@@ -4,7 +4,9 @@ from pathlib import Path
 
 import json
 import numpy as np
+import gymnasium as gym
 
+import uncertain_racecar_gym  # noqa: F401
 from uncertain_racecar_gym.cli import export_replay_main, record_rollout_main
 from uncertain_racecar_gym.replay import export_replay_bundle
 from uncertain_racecar_gym.rendering import PyBulletMirrorRenderer
@@ -87,6 +89,24 @@ def test_renderer_planner_overlay_smoke() -> None:
     renderer.close()
     assert frame is not None
     assert frame.shape == (180, 320, 3)
+
+
+def test_env_render_accepts_custom_frame_size() -> None:
+    env = gym.make(
+        "UncertainRacecar-v0",
+        scenario="package://scenarios/sample_oval.yaml",
+        renderer="pybullet",
+        render_mode="rgb_array_follow",
+        render_width=160,
+        render_height=90,
+        uncertainty=None,
+    )
+    env.reset(seed=0)
+    frame = env.render()
+    env.close()
+
+    assert frame is not None
+    assert frame.shape == (90, 160, 3)
 
 
 def test_export_replay_bundle_serializes_planner_debug_numpy(tmp_path: Path) -> None:

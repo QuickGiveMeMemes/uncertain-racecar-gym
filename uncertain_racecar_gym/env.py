@@ -21,6 +21,7 @@ from uncertain_racecar_gym.uncertainty import EmpiricalUncertaintyModel
 class UncertainRacecarEnv(gym.Env):
     metadata = {
         "render_modes": ["human", "rgb_array_follow", "rgb_array_birds_eye", "rgb_array_cinematic"],
+        "render_fps": 20,
     }
 
     def __init__(
@@ -34,6 +35,8 @@ class UncertainRacecarEnv(gym.Env):
         gaussian_noise_std: Sequence[float] | None = None,
         renderer: str | None = None,
         render_mode: str | None = None,
+        render_width: int = 1280,
+        render_height: int = 720,
         output_dir: str | Path = "output",
     ) -> None:
         super().__init__()
@@ -44,6 +47,10 @@ class UncertainRacecarEnv(gym.Env):
         self.default_uncertainty_mode = self._normalize_uncertainty_mode(uncertainty)
         self.renderer_kind = renderer
         self.render_mode = render_mode
+        self.render_width = int(render_width)
+        self.render_height = int(render_height)
+        if self.render_width <= 0 or self.render_height <= 0:
+            raise ValueError("render_width and render_height must be positive integers.")
         self.renderer = None
         self.reset_rows = None
         self.apply_mean_correction = bool(apply_mean_correction)
@@ -358,7 +365,13 @@ class UncertainRacecarEnv(gym.Env):
         if self.render_mode is None or self.renderer_kind != "pybullet":
             return None
         if self.renderer is None:
-            self.renderer = PyBulletMirrorRenderer(self.scenario, self.track, self.render_mode)
+            self.renderer = PyBulletMirrorRenderer(
+                self.scenario,
+                self.track,
+                self.render_mode,
+                width=self.render_width,
+                height=self.render_height,
+            )
         return self.renderer.render(self._render_state())
 
     def close(self):

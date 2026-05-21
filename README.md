@@ -331,6 +331,70 @@ uv run --extra jax uncertain-racecar-benchmark \
   --output-dir output/smooth_mppi_barcelona_suite
 ```
 
+### MPPI interactive runtime expectations
+
+For interactive debugging, measure a full control tick as:
+
+```text
+controller.act(...) + env.step(action) + PyBullet rgb_array render
+```
+
+Do not include video encoding, MoviePy writing, `cv2.VideoWriter`, or display wait time in that number. Also discard the first tick when timing JAX controllers: the first call pays JAX compilation, and the first render pays PyBullet scene setup.
+
+The live Gym render path supports explicit resolution:
+
+```python
+env = gym.make(
+    "UncertainRacecar-v0",
+    scenario="package://scenarios/ks_barcelona_layout_gp_dallara_f317_rl_long.yaml",
+    uncertainty=None,
+    renderer="pybullet",
+    render_mode="rgb_array_follow",
+    render_width=640,
+    render_height=360,
+)
+```
+
+The benchmark video renderer exposes the same idea through CLI flags:
+
+```bash
+uv run --extra jax uncertain-racecar-benchmark \
+  --suite package://benchmarks/barcelona_nominal_controller_suite.yaml \
+  --controller-kind mppi_jax \
+  --controller-kwargs-json '{"horizon": 28, "num_samples": 384, "optimization_steps": 2, "replan_interval": 2, "debug_render_plans": false}' \
+  --modes nominal \
+  --seeds 0 \
+  --render-cases high_speed_turn_in \
+  --render-mode rgb_array_follow \
+  --render-width 640 \
+  --render-height 360 \
+  --output-dir output/mppi_runtime_check
+```
+
+Planner debug overlays are controlled by the MPPI controller config:
+
+- `debug_render_plans: true`
+  - computes and draws sampled candidate trajectories plus the selected plan
+  - useful for understanding MPPI behavior
+  - costs a little more CPU/GPU time and memory transfer
+- `debug_render_plans: false`
+  - renders only the car and track
+  - better for closed-loop timing and live control displays
+
+On an Apple Silicon Mac, for Barcelona-long with JAX MPPI configured as `horizon=28`, `num_samples=384`, `optimization_steps=2`, and `replan_interval=2`, warmed full-tick timings were approximately:
+
+| Render | MPPI debug overlay | Warm full tick | Approx. FPS |
+| --- | --- | ---: | ---: |
+| `rgb_array_follow`, 1280x720 | on | 181 ms | 5.5 |
+| `rgb_array_follow`, 640x360 | on | 66 ms | 15 |
+| `rgb_array_follow`, 320x180 | on | 38 ms | 26 |
+| `rgb_array_follow`, 640x360 | off | 59 ms | 17 |
+| `rgb_array_follow`, 320x180 | off | 33 ms | 30 |
+
+With `replan_interval=2`, frames alternate between a replanning frame and a cached-action frame. At `640x360` with debug overlays on, the replanning frames were about `88 ms` and cached-action frames about `43 ms`. At `320x180`, replanning frames were about `60 ms` and cached-action frames about `16 ms`.
+
+Bare simulator stepping should be much faster than rendering. After vectorized track projection, Barcelona-long nominal `env.step(...)` without rendering is expected to be well under `1 ms` on a laptop-class machine. If a measured "step" is multiple seconds, it is likely including first-call JAX compilation, PyBullet initialization, video encoding, OpenCV display waits, or another wrapper around the environment.
+
 ## Benchmarking controllers
 
 The benchmark harness lets you compare controllers on the same suite under:
