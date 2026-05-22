@@ -109,7 +109,7 @@ class DynamicBicycleModel:
             self.config.lf * fyf * np.cos(steer_angle) - self.config.lr * fyr
         ) / self.config.inertia_z
 
-        next_vx = max(0.0, state.vx + vx_dot * dt)
+        next_vx = state.vx + vx_dot * dt
         next_vy = state.vy + vy_dot * dt
         next_yaw_rate = state.yaw_rate + yaw_rate_dot * dt
         wheel_rotation = state.wheel_rotation + (next_vx * dt / max(self.config.wheel_radius, 1e-6))
