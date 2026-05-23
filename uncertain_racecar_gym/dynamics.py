@@ -161,7 +161,7 @@ class DynamicBicycleModel:
             residual_values = np.asarray(residual, dtype=float).reshape(-1)
             prediction = replace(
                 prediction,
-                vx=max(0.0, prediction.vx + float(residual_values[0] if len(residual_values) > 0 else 0.0)),
+                vx=prediction.vx + float(residual_values[0] if len(residual_values) > 0 else 0.0),
                 vy=prediction.vy + float(residual_values[1] if len(residual_values) > 1 else 0.0),
                 yaw_rate=prediction.yaw_rate + float(residual_values[2] if len(residual_values) > 2 else 0.0),
                 steer=float(np.clip(prediction.steer + float(residual_values[3] if len(residual_values) > 3 else 0.0), -1.0, 1.0)),
